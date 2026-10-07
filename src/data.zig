@@ -1,13 +1,19 @@
 const std = @import("std");
 const rl = @import("raylib");
 const widgets = @import("widgets.zig");
+const chart = @import("chart.zig");
+const mp3notes = @import("mp3notes.zig");
 
 pub const MAX_SONGS: usize = 32;
+pub const LaneNotes = chart.LaneNotes;
+pub const NO_NOTES: [5]LaneNotes = .{.{0} ** chart.CHUNKS} ** 5;
+pub const HIT_WORDS = (chart.SLOTS + 63) / 64;
+pub const NO_HITS: [5][HIT_WORDS]u64 = .{.{0} ** HIT_WORDS} ** 5;
 pub const SongNode = struct {
     title: [:0]const u8,
     file_path: [:0]const u8,
     bps: f32,
-    notes: [5][10]u128 = .{.{0} ** 10} ** 5,
+    notes: [5]LaneNotes = NO_NOTES,
     prev: ?*SongNode,
     next: ?*SongNode,
 };
@@ -18,7 +24,6 @@ pub const SongList = struct {
     head: ?*SongNode = null,
     tail: ?*SongNode = null,
     current: ?*SongNode = null,
-    notes: [5][10]u128 = .{.{0} ** 10} ** 5,
 
     pub fn append(self: *SongList, title: [:0]const u8, file_path: [:0]const u8, bps: f32) void {
         if (self.poolLen >= MAX_SONGS) return;
@@ -94,12 +99,6 @@ pub const SongList = struct {
         self.tail = null;
         self.current = null;
     }
-
-    pub fn genNotes(self: *SongList) [5][10]u128 {
-        std.debug.print("Song name {s}", .{self.current.?.title});
-        self.notes = .{.{0} ** 10} ** 5;
-        return self.notes;
-    }
 };
 pub const Settings = struct {
     keys: [6]rl.KeyboardKey = .{ rl.KeyboardKey.a, rl.KeyboardKey.s, rl.KeyboardKey.d, rl.KeyboardKey.f, rl.KeyboardKey.space, rl.KeyboardKey.v },
@@ -116,20 +115,20 @@ pub const Settings = struct {
 };
 pub const GameState = struct {
     paused: bool = false,
-    showingQueue: bool = false,
-    showingSettings: bool = false,
+    showing_queue: bool = false,
+    showing_settings: bool = false,
     songs: SongList = .{},
-    notes: [5][10]u128 = .{.{0} ** 10} ** 5,
+    notes: [5]LaneNotes = NO_NOTES,
     starMultiplier: u8 = 1,
     starCount: u8 = 1,
     comboCount: u32 = 0,
     score: u32 = 0,
     beat: f32 = 0,
-    hitMask: [5][5]u64 = .{.{0} ** 5} ** 5,
+    hitMask: [5][HIT_WORDS]u64 = NO_HITS,
     missSlot: [5]usize = .{0} ** 5,
     holdActive: [5]bool = .{false} ** 5,
-    holdSlot: [5]u8 = .{0} ** 5,
-    holdLen: [5]u8 = .{0} ** 5,
+    holdSlot: [5]usize = .{0} ** 5,
+    holdLen: [5]u16 = .{0} ** 5,
     holdStartBeat: [5]f32 = .{0} ** 5,
     prevSong: ?*SongNode = null,
     starPowerMeter: f32 = 0.0,
@@ -139,26 +138,6 @@ pub const GameState = struct {
     maxCombo: u32 = 0,
     endBeat: f32 = 0,
     resultsCountdown: f32 = -1.0,
-
-    fn loadSong(self: *GameState, songList: *SongList) void {
-        std.debug.print("Song name {s}", .{songList.current.?.title});
-        if (songList.current) |song| {
-            self.notes = song.notes;
-        }
-        self.beat = 0;
-        self.hitMask = .{.{0} ** 5} ** 5;
-        self.missSlot = .{0} ** 5;
-        self.holdActive = .{false} ** 5;
-        self.holdStartBeat = .{0} ** 5;
-        self.starPowerMeter = 0.0;
-        self.starPowerActive = false;
-        self.starPowerTimer = 0.0;
-        self.starPowerComboComplete = false;
-        self.maxCombo = 0;
-        self.resultsCountdown = -1.0;
-        self.endBeat = 0;
-        self.prevSong = songList.current;
-    }
 };
 pub const NoteStats = struct {
     total: u32,
@@ -175,7 +154,7 @@ pub const UiTheme = struct {
     keyBtnPress: rl.Color = .{ .r = 28, .g = 42, .b = 70, .a = 255 },
 };
 pub var theme = UiTheme{};
-pub const Screen = enum { main, settings, songSelect, game, results, exit };
+pub const Screen = enum { main, settings, songSelect, game, results, import_song, exit };
 // Persistent overlay state (lives here, not in GameState, because it's purely UI).
 pub var queueOverlay = widgets.DragListOverlay{};
 // Song select screen state
@@ -187,7 +166,7 @@ pub const DiscoveredSong = struct {
     selected: bool = false,
     texture: rl.Texture2D = undefined,
     has_texture: bool = false,
-    notes: [5][10]u128 = .{.{0} ** 10} ** 5,
+    notes: [5]LaneNotes = NO_NOTES,
 };
 pub var discovered: [MAX_DISCOVERED]DiscoveredSong = undefined;
 pub var discovered_count: usize = 0;
@@ -216,3 +195,27 @@ pub const SettingsUiState = struct {
 };
 pub var settings_state = SettingsUiState{};
 pub var slot_indices = [6]usize{ 0, 1, 2, 3, 4, 5 };
+// Song import (drag-and-drop an mp3 onto the window)
+pub const ImportPhase = enum { idle, analyzing, ready, failed };
+pub const ImportState = struct {
+    phase: ImportPhase = .idle,
+    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    thread: ?std.Thread = null,
+    // Written by the worker thread before `done` is set.
+    done: std.atomic.Value(bool) = .init(false),
+    bytes: []const u8 = &.{},
+    analysis: ?mp3notes.Analysis = null,
+    err: ?anyerror = null,
+    cancelled: bool = false,
+    folder: [128]u8 = undefined,
+    folder_len: usize = 0,
+    title: [64:0]u8 = .{0} ** 64,
+    role: ?chart.Role = null,
+    difficulty: chart.Difficulty = .hard,
+    return_screen: Screen = .songSelect,
+
+    pub fn folder_path(self: *const ImportState) []const u8 {
+        return self.folder[0..self.folder_len];
+    }
+};
+pub var import_state = ImportState{};

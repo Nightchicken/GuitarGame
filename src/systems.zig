@@ -1,50 +1,51 @@
 const std = @import("std");
 const rl = @import("raylib");
 const data = @import("data.zig");
+const chart = @import("chart.zig");
 
-pub const SLOTS: usize = 300;
+pub const SLOTS: usize = chart.SLOTS;
 pub const SCROLL_BEATS: f32 = 8.0;
 pub const HIT_WINDOW: f32 = 0.35;
-pub fn getNoteU128(laneNotes: [10]u128, slot: usize) u128 {
-    return laneNotes[slot / 42];
+pub fn getNoteU128(laneNotes: data.LaneNotes, slot: usize) u128 {
+    return laneNotes[slot / chart.SLOTS_PER_CHUNK];
 }
 pub fn getNoteOffset(slot: usize) usize {
-    return (slot % 42) * 3;
+    return (slot % chart.SLOTS_PER_CHUNK) * 3;
 }
-pub fn getHitU64(hitMask: [5]u64, slot: usize) u64 {
+pub fn getHitU64(hitMask: [data.HIT_WORDS]u64, slot: usize) u64 {
     return hitMask[slot / 64];
 }
 pub fn getHitOffset(slot: usize) usize {
     return slot % 64;
 }
-pub fn isHitMarked(hitMask: [5]u64, slot: usize) bool {
+pub fn isHitMarked(hitMask: [data.HIT_WORDS]u64, slot: usize) bool {
     return (getHitU64(hitMask, slot) >> @intCast(getHitOffset(slot))) & 1 != 0;
 }
-pub fn markHit(hitMask: *[5]u64, slot: usize) void {
+pub fn markHit(hitMask: *[data.HIT_WORDS]u64, slot: usize) void {
     const u64Idx = slot / 64;
     const offset = slot % 64;
     hitMask[u64Idx] |= @as(u64, 1) << @intCast(offset);
 }
 
-pub inline fn present(laneNotes: [10]u128, slot: usize) bool {
+pub inline fn present(laneNotes: data.LaneNotes, slot: usize) bool {
     const noteU128 = getNoteU128(laneNotes, slot);
     const offset = getNoteOffset(slot);
     return (noteU128 >> @intCast(offset)) & 1 != 0;
 }
 
-pub inline fn isHalf(laneNotes: [10]u128, slot: usize) bool {
+pub inline fn isHalf(laneNotes: data.LaneNotes, slot: usize) bool {
     const noteU128 = getNoteU128(laneNotes, slot);
     const offset = getNoteOffset(slot);
     return (noteU128 >> @intCast(offset + 1)) & 1 != 0;
 }
 
-pub inline fn connected(laneNotes: [10]u128, slot: usize) bool {
+pub inline fn connected(laneNotes: data.LaneNotes, slot: usize) bool {
     const noteU128 = getNoteU128(laneNotes, slot);
     const offset = getNoteOffset(slot);
     return (noteU128 >> @intCast(offset + 2)) & 1 != 0;
 }
-pub fn holdLen(laneNotes: [10]u128, slot: usize) u8 {
-    var len: u8 = 1;
+pub fn holdLen(laneNotes: data.LaneNotes, slot: usize) u16 {
+    var len: u16 = 1;
     var s = slot;
     while (s + 1 < SLOTS and connected(laneNotes, s + 1)) : (s += 1) len += 1;
     return len;
@@ -121,7 +122,7 @@ pub fn countNoteStats(state: *const data.GameState) data.NoteStats {
 pub fn update(state: *data.GameState, settings: *const data.Settings) void {
     if (state.songs.current != state.prevSong) {
         state.beat = 0;
-        state.hitMask = .{.{0} ** 5} ** 5;
+        state.hitMask = data.NO_HITS;
         state.missSlot = .{0} ** 5;
         state.holdActive = .{false} ** 5;
         state.holdStartBeat = .{0} ** 5;
@@ -131,6 +132,7 @@ pub fn update(state: *data.GameState, settings: *const data.Settings) void {
         state.starPowerComboComplete = false;
         state.resultsCountdown = -1.0;
         state.prevSong = state.songs.current;
+        state.notes = if (state.songs.current) |song| song.notes else data.NO_NOTES;
         computeEndBeat(state);
     }
 
@@ -211,7 +213,7 @@ pub fn update(state: *data.GameState, settings: *const data.Settings) void {
                 markHit(&state.hitMask[l], slot);
                 if (connected(laneBits, slot)) {
                     state.holdActive[l] = true;
-                    state.holdSlot[l] = @intCast(slot);
+                    state.holdSlot[l] = slot;
                     state.holdLen[l] = holdLen(laneBits, slot);
                     state.holdStartBeat[l] = state.beat;
                 } else {
@@ -329,6 +331,30 @@ pub fn loadUiThemeInner(io: std.Io) !void {
         }
     }
 }
+/// Generates meta.cfg for a song folder that has an mp3 but no chart yet.
+fn auto_chart(io: std.Io, songs_dir: std.Io.Dir, name: []const u8) void {
+    var dir = songs_dir.openDir(io, name, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    if (dir.access(io, "meta.cfg", .{})) |_| return else |_| {}
+    const im = &data.import_state;
+    if (im.phase != .idle and std.mem.eql(u8, std.fs.path.basename(im.folder_path()), name)) return;
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.ascii.endsWithIgnoreCase(entry.name, ".mp3")) continue;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const song_dir = std.fmt.allocPrint(a, "songs/{s}", .{name}) catch return;
+        const mp3_path = std.fmt.allocPrint(a, "{s}/{s}", .{ song_dir, entry.name }) catch return;
+        std.debug.print("charting {s}\n", .{mp3_path});
+        _ = chart.chart_song(a, io, mp3_path, song_dir, .{ .title = name }) catch |err| {
+            std.debug.print("charting {s} failed: {t}\n", .{ mp3_path, err });
+        };
+        return;
+    }
+}
+
 pub fn scan_songs(io: std.Io) void {
     // Clear textures
     for (data.discovered[0..data.discovered_count]) |*d| {
@@ -348,10 +374,13 @@ pub fn scan_songs(io: std.Io) void {
         if (entry.kind != .directory) continue;
 
         var songData = &data.discovered[data.discovered_count];
+        songData.* = .{};
         data.discovered_count += 1;
 
         @memcpy(songData.folder[0..entry.name.len], entry.name);
         songData.folder[entry.name.len] = 0;
+
+        auto_chart(io, songsDir, entry.name);
 
         var metaPathBuf: [256]u8 = undefined;
         const metaPath = std.fmt.bufPrintZ(&metaPathBuf, "songs/{s}/meta.cfg", .{entry.name}) catch {
@@ -360,7 +389,7 @@ pub fn scan_songs(io: std.Io) void {
             continue;
         };
 
-        var metaBuf: [512]u8 = undefined;
+        var metaBuf: [32 * 1024]u8 = undefined;
         const metaContent = std.Io.Dir.cwd().readFile(io, metaPath, &metaBuf) catch {
             songData.title[0] = 0;
             songData.bps = 2.5;
@@ -389,7 +418,7 @@ pub fn scan_songs(io: std.Io) void {
                         const laneKey = std.fmt.bufPrintZ(&laneKeyBuf, "notes_lane{d}", .{lane}) catch continue;
                         if (std.mem.eql(u8, key, laneKey)) {
                             var hexVals = std.mem.splitSequence(u8, val, ",");
-                            for (0..10) |chunk| {
+                            for (0..chart.CHUNKS) |chunk| {
                                 if (hexVals.next()) |hexStr| {
                                     const hexTrimmed = std.mem.trim(u8, hexStr, " \t");
                                     songData.notes[lane][chunk] = std.fmt.parseInt(u128, hexTrimmed, 0) catch 0;
@@ -424,4 +453,118 @@ pub fn scan_songs(io: std.Io) void {
         }
         songData.selected = false;
     }
+}
+
+// ─ Song import ─────────────────────────────────────────────────────────────
+const mp3notes = @import("mp3notes.zig");
+
+/// Copies a dropped mp3 into a fresh songs/<name>/ folder and starts analyzing it in the background.
+pub fn start_import(io: std.Io, path: []const u8, from: data.Screen) bool {
+    const im = &data.import_state;
+    if (im.phase == .analyzing) return false;
+    cancel_import(io);
+    im.return_screen = if (from == .import_song) im.return_screen else from;
+
+    const stem = std.fs.path.stem(path);
+    const title_len = @min(stem.len, im.title.len - 1);
+    @memcpy(im.title[0..title_len], stem[0..title_len]);
+    im.title[title_len] = 0;
+
+    const cwd = std.Io.Dir.cwd();
+    var n: usize = 1;
+    while (true) : (n += 1) {
+        const folder = if (n == 1)
+            std.fmt.bufPrint(&im.folder, "songs/{s}", .{stem[0..title_len]})
+        else
+            std.fmt.bufPrint(&im.folder, "songs/{s}_{d}", .{ stem[0..title_len], n });
+        im.folder_len = (folder catch return fail_import(error.NameTooLong)).len;
+        if (cwd.access(io, im.folder_path(), .{})) |_| continue else |_| break;
+    }
+
+    const a = im.arena.allocator();
+    const copy = chart.copy_into(a, io, path, im.folder_path()) catch |err| return fail_import(err);
+    im.bytes = cwd.readFileAlloc(io, copy, a, .limited(1 << 30)) catch |err| return fail_import(err);
+    im.phase = .analyzing;
+    im.thread = std.Thread.spawn(.{}, import_worker, .{}) catch |err| return fail_import(err);
+    return true;
+}
+
+fn import_worker() void {
+    const im = &data.import_state;
+    const a = im.arena.allocator();
+    if (mp3notes.decode_mp3(a, im.bytes)) |audio| {
+        im.analysis = mp3notes.analyze(a, audio, mp3notes.tempo_prior(null)) catch |err| blk: {
+            im.err = err;
+            break :blk null;
+        };
+    } else |err| im.err = err;
+    im.done.store(true, .release);
+}
+
+fn fail_import(err: anyerror) bool {
+    data.import_state.err = err;
+    data.import_state.phase = .failed;
+    return true;
+}
+
+/// Call every frame: picks up a finished analysis, or cleans up after a cancel.
+pub fn poll_import(io: std.Io) void {
+    const im = &data.import_state;
+    if (im.phase != .analyzing or !im.done.load(.acquire)) return;
+    if (im.thread) |t| t.join();
+    im.thread = null;
+    if (im.cancelled) {
+        delete_import_folder(io);
+        reset_import();
+    } else {
+        im.phase = if (im.analysis != null) .ready else .failed;
+    }
+}
+
+pub fn import_preview() ?chart.Chart {
+    const im = &data.import_state;
+    const r = im.analysis orelse return null;
+    return chart.build(r, .{ .role = im.role, .difficulty = im.difficulty });
+}
+
+/// Writes meta.cfg for the analyzed song; returns false if the import isn't ready or the write failed.
+pub fn finish_import(io: std.Io) bool {
+    const im = &data.import_state;
+    const preview = import_preview() orelse return false;
+    var path_buf: [160]u8 = undefined;
+    const meta = std.fmt.bufPrint(&path_buf, "{s}/meta.cfg", .{im.folder_path()}) catch return false;
+    chart.write_meta(io, meta, std.mem.sliceTo(&im.title, 0), preview) catch |err| return !fail_import(err);
+    reset_import();
+    data.song_select_needs_scan = true;
+    return true;
+}
+
+/// Removes the copied song folder; if analysis is still running, cleanup happens when it finishes.
+pub fn cancel_import(io: std.Io) void {
+    const im = &data.import_state;
+    if (im.phase == .analyzing) {
+        im.cancelled = true;
+        return;
+    }
+    delete_import_folder(io);
+    reset_import();
+}
+
+fn delete_import_folder(io: std.Io) void {
+    const im = &data.import_state;
+    if (im.folder_len == 0) return;
+    std.Io.Dir.cwd().deleteTree(io, im.folder_path()) catch {};
+}
+
+fn reset_import() void {
+    const im = &data.import_state;
+    _ = im.arena.reset(.free_all);
+    im.phase = .idle;
+    im.thread = null;
+    im.done.store(false, .release);
+    im.bytes = &.{};
+    im.analysis = null;
+    im.err = null;
+    im.cancelled = false;
+    im.folder_len = 0;
 }

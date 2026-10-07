@@ -2,6 +2,7 @@ const std = @import("std");
 const rl = @import("raylib");
 const widgets = @import("widgets.zig");
 const data = @import("data.zig");
+const chart = @import("chart.zig");
 const systems = @import("systems.zig");
 
 pub fn drawSongSelect(ui: *widgets.WidgetStream, io: std.Io, state: *data.GameState) data.Screen {
@@ -77,7 +78,7 @@ pub fn drawSongSelect(ui: *widgets.WidgetStream, io: std.Io, state: *data.GameSt
     }
 
     if (data.discovered_count == 0) {
-        rl.drawText("No songs found. Add folders to songs/ directory.", @intFromFloat(20), @intFromFloat(header_h + 20), 20, .{ .r = 150, .g = 150, .b = 150, .a = 255 });
+        rl.drawText("No songs found. Drop an .mp3 onto the window to import one.", @intFromFloat(20), @intFromFloat(header_h + 20), 20, .{ .r = 150, .g = 150, .b = 150, .a = 255 });
     } else {
         for (data.discovered[0..data.discovered_count], 0..) |*song, i| {
             const card_y = header_h + @as(f32, @floatFromInt(i)) * (card_h + card_pad) - data.song_scroll_y;
@@ -162,6 +163,8 @@ pub fn drawSongSelect(ui: *widgets.WidgetStream, io: std.Io, state: *data.GameSt
     const count_w = rl.measureText(count_str, count_size);
     rl.drawText(count_str, @intFromFloat(sw / 2.0 - @as(f32, @floatFromInt(count_w)) / 2.0), @intFromFloat(sh - footer_h + (footer_h - @as(f32, @floatFromInt(count_size))) / 2.0), count_size, .{ .r = 180, .g = 180, .b = 180, .a = 255 });
 
+    rl.drawText("Drop an .mp3 here to import", 12, @intFromFloat(sh - footer_h + (footer_h - 14) / 2.0), 14, .{ .r = 120, .g = 120, .b = 140, .a = 255 });
+
     ui.processAndDraw();
 
     if (back_pressed) {
@@ -177,6 +180,8 @@ pub fn drawSongSelect(ui: *widgets.WidgetStream, io: std.Io, state: *data.GameSt
 
     if (start_pressed and any_selected) {
         state.songs.reset();
+        // Pool slots are reused, so force update() to treat the first song as new.
+        state.prevSong = null;
         for (data.discovered[0..data.discovered_count]) |*d| {
             if (d.selected) {
                 state.songs.append(d.title[0..], d.folder[0..], d.bps);
@@ -345,7 +350,7 @@ pub fn drawNotes(state: *const data.GameState, settings: *const data.Settings, s
                 const barY1 = @max(noteY, holdYRaw);
 
                 const barCol: rl.Color = if (state.holdActive[l] and
-                    state.holdSlot[l] == @as(u8, @intCast(s)))
+                    state.holdSlot[l] == s)
                     settings.colors[5]
                 else
                     lane_col;
@@ -1307,4 +1312,118 @@ pub fn drawPauseMenu(ui: *widgets.WidgetStream, state: *data.GameState) bool {
 pub fn setBool(ctx: ?*anyopaque) void {
     const b: *bool = @ptrCast(@alignCast(ctx.?));
     b.* = true;
+}
+
+fn choice_button(ui: *widgets.WidgetStream, rect: rl.Rectangle, lbl: [:0]const u8, selected: bool, pressed: *bool) void {
+    ui.buttonStyled(rect, .{
+        .label = lbl,
+        .color = if (selected) .{ .r = 40, .g = 90, .b = 170, .a = 255 } else .{ .r = 60, .g = 60, .b = 75, .a = 255 },
+        .hover_color = if (selected) .{ .r = 60, .g = 120, .b = 210, .a = 255 } else .{ .r = 90, .g = 90, .b = 110, .a = 255 },
+        .press_color = .{ .r = 30, .g = 60, .b = 120, .a = 255 },
+    }, .{ .func = setBool, .ctx = pressed });
+}
+
+pub fn draw_import(ui: *widgets.WidgetStream, io: std.Io) data.Screen {
+    const sw: f32 = @floatFromInt(rl.getScreenWidth());
+    const sh: f32 = @floatFromInt(rl.getScreenHeight());
+    const im = &data.import_state;
+    const grey: rl.Color = .{ .r = 180, .g = 180, .b = 180, .a = 255 };
+
+    const panel_w = @min(sw - 40, 640);
+    const px = (sw - panel_w) / 2.0;
+    const row_h: f32 = 40;
+    const gap: f32 = 10;
+    const col_w = (panel_w - gap * 3) / 4.0;
+    var y: f32 = sh * 0.08;
+
+    var role_pressed = [_]bool{false} ** 4;
+    var diff_pressed = [_]bool{false} ** 4;
+    var cancel_pressed = false;
+    var create_pressed = false;
+    var role_bufs: [4][32]u8 = undefined;
+    var status_buf: [128]u8 = undefined;
+    var preview_buf: [128]u8 = undefined;
+
+    ui.begin();
+
+    rl.drawText("Import Song", @intFromFloat(px), @intFromFloat(y), 36, rl.Color.white);
+    y += 46;
+    rl.drawText(&im.title, @intFromFloat(px), @intFromFloat(y), 22, grey);
+    y += 40;
+
+    const status: [:0]const u8 = switch (im.phase) {
+        .idle => "Drop an .mp3 onto the window",
+        .analyzing => if (im.cancelled) "Cancelling..." else blk: {
+            const dots = "..."[0 .. @as(usize, @intFromFloat(rl.getTime() * 2)) % 4];
+            break :blk std.fmt.bufPrintZ(&status_buf, "Analyzing{s}  (about 15 s)", .{dots}) catch "Analyzing...";
+        },
+        .ready => "Analysis done - pick an instrument and difficulty",
+        .failed => std.fmt.bufPrintZ(&status_buf, "Import failed: {t}", .{im.err orelse error.Unknown}) catch "Import failed",
+    };
+    rl.drawText(status, @intFromFloat(px), @intFromFloat(y), 18, if (im.phase == .failed) rl.Color.red else grey);
+    y += 40;
+
+    const prev: ?[3]f32 = if (im.analysis) |r| chart.prevalences(r) else null;
+    rl.drawText("Instrument", @intFromFloat(px), @intFromFloat(y), 20, rl.Color.white);
+    y += 28;
+    for (0..4) |i| {
+        const role: ?chart.Role = if (i == 0) null else @enumFromInt(i - 1);
+        const name = if (role) |r| @tagName(r) else "auto";
+        const lbl: [:0]const u8 = if (role != null and prev != null)
+            std.fmt.bufPrintZ(&role_bufs[i], "{s} {d:.0}%", .{ name, prev.?[i - 1] * 100 }) catch name
+        else if (role == null and prev != null)
+            std.fmt.bufPrintZ(&role_bufs[i], "auto ({s})", .{@tagName(chart.most_prevalent(prev.?))}) catch name
+        else
+            name;
+        const rect = rl.Rectangle{ .x = px + @as(f32, @floatFromInt(i)) * (col_w + gap), .y = y, .width = col_w, .height = row_h };
+        choice_button(ui, rect, lbl, im.role == role, &role_pressed[i]);
+    }
+    y += row_h + 24;
+
+    rl.drawText("Difficulty", @intFromFloat(px), @intFromFloat(y), 20, rl.Color.white);
+    y += 28;
+    for (std.enums.values(chart.Difficulty), 0..) |d, i| {
+        const rect = rl.Rectangle{ .x = px + @as(f32, @floatFromInt(i)) * (col_w + gap), .y = y, .width = col_w, .height = row_h };
+        choice_button(ui, rect, @tagName(d), im.difficulty == d, &diff_pressed[i]);
+    }
+    y += row_h + 24;
+
+    if (systems.import_preview()) |c| {
+        const p = c.difficulty.params();
+        const preview = std.fmt.bufPrintZ(&preview_buf, "{d} notes  |  {d:.0} BPM  |  {d} lanes  |  charting {s}", .{
+            c.note_count, c.bps * 60 / @as(f32, @floatFromInt(p.subdivision)), p.lanes, @tagName(c.role),
+        }) catch "";
+        rl.drawText(preview, @intFromFloat(px), @intFromFloat(y), 18, grey);
+    }
+
+    const btn_w: f32 = 140;
+    const btn_y = sh - 70;
+    ui.button(.{ .x = px, .y = btn_y, .width = btn_w, .height = row_h }, "Cancel", .{ .func = setBool, .ctx = &cancel_pressed });
+    const ready = im.phase == .ready;
+    ui.buttonStyled(
+        .{ .x = px + panel_w - btn_w, .y = btn_y, .width = btn_w, .height = row_h },
+        .{
+            .label = "Create",
+            .color = if (ready) .{ .r = 30, .g = 80, .b = 30, .a = 255 } else .{ .r = 60, .g = 60, .b = 60, .a = 255 },
+            .hover_color = if (ready) .{ .r = 50, .g = 120, .b = 50, .a = 255 } else .{ .r = 80, .g = 80, .b = 80, .a = 255 },
+            .press_color = if (ready) .{ .r = 20, .g = 55, .b = 20, .a = 255 } else .{ .r = 50, .g = 50, .b = 50, .a = 255 },
+        },
+        if (ready) .{ .func = setBool, .ctx = &create_pressed } else null,
+    );
+
+    ui.processAndDraw();
+
+    for (role_pressed, 0..) |pressed, i| if (pressed) {
+        im.role = if (i == 0) null else @enumFromInt(i - 1);
+    };
+    for (diff_pressed, 0..) |pressed, i| if (pressed) {
+        im.difficulty = @enumFromInt(i);
+    };
+    if (cancel_pressed) {
+        const back = im.return_screen;
+        systems.cancel_import(io);
+        return back;
+    }
+    if (create_pressed and systems.finish_import(io)) return .songSelect;
+    return .import_song;
 }

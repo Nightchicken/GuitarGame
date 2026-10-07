@@ -1,8 +1,5 @@
-//! mp3notes: decode an MP3 and transcribe it to a text file (bpm, beats, key, chords,
-//! drum hits and pitched notes per instrument role).
-//!
-//!   zig build-exe -O ReleaseFast mp3notes.zig
-//!   ./mp3notes song.mp3 [out.txt] [--wav decoded.wav]
+//! mp3notes: decode an MP3 and transcribe it (bpm, beats, key, chords, drum hits and
+//! pitched notes per instrument role). Every function allocates without freeing, so pass an arena.
 //!
 //! The Layer III decoder is a port of minimp3 (https://github.com/lieff/minimp3, CC0).
 
@@ -23,86 +20,86 @@ const HDR_SIZE = 4;
 const MAX_SCFI = 44;
 const MAX_SAMPLES_PER_FRAME = 1152 * 2;
 
-fn hdrIsMono(h: []const u8) bool {
+fn hdr_is_mono(h: []const u8) bool {
     return (h[3] & 0xC0) == 0xC0;
 }
-fn hdrIsMsStereo(h: []const u8) bool {
+fn hdr_is_ms_stereo(h: []const u8) bool {
     return (h[3] & 0xE0) == 0x60;
 }
-fn hdrIsFreeFormat(h: []const u8) bool {
+fn hdr_is_free_format(h: []const u8) bool {
     return (h[2] & 0xF0) == 0;
 }
-fn hdrIsCrc(h: []const u8) bool {
+fn hdr_is_crc(h: []const u8) bool {
     return (h[1] & 1) == 0;
 }
-fn hdrTestPadding(h: []const u8) bool {
+fn hdr_test_padding(h: []const u8) bool {
     return (h[2] & 0x2) != 0;
 }
-fn hdrTestMpeg1(h: []const u8) bool {
+fn hdr_test_mpeg1(h: []const u8) bool {
     return (h[1] & 0x8) != 0;
 }
-fn hdrTestNotMpeg25(h: []const u8) bool {
+fn hdr_test_not_mpeg25(h: []const u8) bool {
     return (h[1] & 0x10) != 0;
 }
-fn hdrTestIStereo(h: []const u8) bool {
+fn hdr_test_i_stereo(h: []const u8) bool {
     return (h[3] & 0x10) != 0;
 }
-fn hdrTestMsStereo(h: []const u8) bool {
+fn hdr_test_ms_stereo(h: []const u8) bool {
     return (h[3] & 0x20) != 0;
 }
-fn hdrLayer(h: []const u8) u8 {
+fn hdr_layer(h: []const u8) u8 {
     return (h[1] >> 1) & 3;
 }
-fn hdrBitrateIdx(h: []const u8) u8 {
+fn hdr_bitrate_idx(h: []const u8) u8 {
     return h[2] >> 4;
 }
-fn hdrSampleRateIdx(h: []const u8) u8 {
+fn hdr_sample_rate_idx(h: []const u8) u8 {
     return (h[2] >> 2) & 3;
 }
-fn hdrMySampleRate(h: []const u8) u8 {
-    return hdrSampleRateIdx(h) + (((h[1] >> 3) & 1) + ((h[1] >> 4) & 1)) * 3;
+fn hdr_my_sample_rate(h: []const u8) u8 {
+    return hdr_sample_rate_idx(h) + (((h[1] >> 3) & 1) + ((h[1] >> 4) & 1)) * 3;
 }
-fn hdrIsFrame576(h: []const u8) bool {
+fn hdr_is_frame576(h: []const u8) bool {
     return (h[1] & 14) == 2;
 }
-fn hdrIsLayer1(h: []const u8) bool {
+fn hdr_is_layer1(h: []const u8) bool {
     return (h[1] & 6) == 6;
 }
 
-fn hdrValid(h: []const u8) bool {
+fn hdr_valid(h: []const u8) bool {
     return h[0] == 0xff and
         ((h[1] & 0xF0) == 0xf0 or (h[1] & 0xFE) == 0xe2) and
-        hdrLayer(h) != 0 and hdrBitrateIdx(h) != 15 and hdrSampleRateIdx(h) != 3;
+        hdr_layer(h) != 0 and hdr_bitrate_idx(h) != 15 and hdr_sample_rate_idx(h) != 3;
 }
 
-fn hdrCompare(h1: []const u8, h2: []const u8) bool {
-    return hdrValid(h2) and
+fn hdr_compare(h1: []const u8, h2: []const u8) bool {
+    return hdr_valid(h2) and
         ((h1[1] ^ h2[1]) & 0xFE) == 0 and
         ((h1[2] ^ h2[2]) & 0x0C) == 0 and
-        hdrIsFreeFormat(h1) == hdrIsFreeFormat(h2);
+        hdr_is_free_format(h1) == hdr_is_free_format(h2);
 }
 
-fn hdrBitrateKbps(h: []const u8) u32 {
-    return 2 * @as(u32, HALFRATE[@intFromBool(hdrTestMpeg1(h))][hdrLayer(h) - 1][hdrBitrateIdx(h)]);
+fn hdr_bitrate_kbps(h: []const u8) u32 {
+    return 2 * @as(u32, HALFRATE[@intFromBool(hdr_test_mpeg1(h))][hdr_layer(h) - 1][hdr_bitrate_idx(h)]);
 }
 
-fn hdrSampleRateHz(h: []const u8) u32 {
+fn hdr_sample_rate_hz(h: []const u8) u32 {
     const hz = [3]u32{ 44100, 48000, 32000 };
-    return hz[hdrSampleRateIdx(h)] >> @intFromBool(!hdrTestMpeg1(h)) >> @intFromBool(!hdrTestNotMpeg25(h));
+    return hz[hdr_sample_rate_idx(h)] >> @intFromBool(!hdr_test_mpeg1(h)) >> @intFromBool(!hdr_test_not_mpeg25(h));
 }
 
-fn hdrFrameSamples(h: []const u8) usize {
-    return if (hdrIsLayer1(h)) 384 else @as(usize, 1152) >> @intFromBool(hdrIsFrame576(h));
+fn hdr_frame_samples(h: []const u8) usize {
+    return if (hdr_is_layer1(h)) 384 else @as(usize, 1152) >> @intFromBool(hdr_is_frame576(h));
 }
 
-fn hdrFrameBytes(h: []const u8, free_format_size: usize) usize {
-    var frame_bytes = hdrFrameSamples(h) * hdrBitrateKbps(h) * 125 / hdrSampleRateHz(h);
-    if (hdrIsLayer1(h)) frame_bytes &= ~@as(usize, 3);
+fn hdr_frame_bytes(h: []const u8, free_format_size: usize) usize {
+    var frame_bytes = hdr_frame_samples(h) * hdr_bitrate_kbps(h) * 125 / hdr_sample_rate_hz(h);
+    if (hdr_is_layer1(h)) frame_bytes &= ~@as(usize, 3);
     return if (frame_bytes != 0) frame_bytes else free_format_size;
 }
 
-fn hdrPadding(h: []const u8) usize {
-    return if (hdrTestPadding(h)) (if (hdrIsLayer1(h)) @as(usize, 4) else 1) else 0;
+fn hdr_padding(h: []const u8) usize {
+    return if (hdr_test_padding(h)) (if (hdr_is_layer1(h)) @as(usize, 4) else 1) else 0;
 }
 
 const BitStream = struct {
@@ -114,7 +111,7 @@ const BitStream = struct {
         return .{ .buf = data, .limit = data.len * 8 };
     }
 
-    fn getBits(bs: *BitStream, n: u32) u32 {
+    fn get_bits(bs: *BitStream, n: u32) u32 {
         const s: u32 = @intCast(bs.pos & 7);
         var shl: i32 = @intCast(n + s);
         var p = bs.pos >> 3;
@@ -161,40 +158,40 @@ const FrameInfo = struct {
     bitrate_kbps: u32 = 0,
 };
 
-fn l3ReadSideInfo(bs: *BitStream, gr: []GrInfo, hdr: []const u8) i32 {
-    const mpeg1 = hdrTestMpeg1(hdr);
+fn l3_read_side_info(bs: *BitStream, gr: []GrInfo, hdr: []const u8) i32 {
+    const mpeg1 = hdr_test_mpeg1(hdr);
     var tables: u32 = 0;
     var scfsi: u32 = 0;
     var main_data_begin: i32 = 0;
     var part_23_sum: usize = 0;
-    var sr_idx: usize = hdrMySampleRate(hdr);
+    var sr_idx: usize = hdr_my_sample_rate(hdr);
     if (sr_idx != 0) sr_idx -= 1;
-    var gr_count: u32 = if (hdrIsMono(hdr)) 1 else 2;
+    var gr_count: u32 = if (hdr_is_mono(hdr)) 1 else 2;
 
     if (mpeg1) {
         gr_count *= 2;
-        main_data_begin = @intCast(bs.getBits(9));
-        scfsi = bs.getBits(7 + gr_count);
+        main_data_begin = @intCast(bs.get_bits(9));
+        scfsi = bs.get_bits(7 + gr_count);
     } else {
-        main_data_begin = @intCast(bs.getBits(8 + gr_count) >> @intCast(gr_count));
+        main_data_begin = @intCast(bs.get_bits(8 + gr_count) >> @intCast(gr_count));
     }
 
     for (0..gr_count) |gi| {
         const g = &gr[gi];
-        if (hdrIsMono(hdr)) scfsi <<= 4;
-        g.part_23_length = @intCast(bs.getBits(12));
+        if (hdr_is_mono(hdr)) scfsi <<= 4;
+        g.part_23_length = @intCast(bs.get_bits(12));
         part_23_sum += g.part_23_length;
-        g.big_values = @intCast(bs.getBits(9));
+        g.big_values = @intCast(bs.get_bits(9));
         if (g.big_values > 288) return -1;
-        g.global_gain = @intCast(bs.getBits(8));
-        g.scalefac_compress = @intCast(bs.getBits(if (mpeg1) 4 else 9));
+        g.global_gain = @intCast(bs.get_bits(8));
+        g.scalefac_compress = @intCast(bs.get_bits(if (mpeg1) 4 else 9));
         g.sfbtab = &SCF_LONG[sr_idx];
         g.n_long_sfb = 22;
         g.n_short_sfb = 0;
-        if (bs.getBits(1) != 0) {
-            g.block_type = @intCast(bs.getBits(2));
+        if (bs.get_bits(1) != 0) {
+            g.block_type = @intCast(bs.get_bits(2));
             if (g.block_type == 0) return -1;
-            g.mixed_block_flag = @intCast(bs.getBits(1));
+            g.mixed_block_flag = @intCast(bs.get_bits(1));
             g.region_count[0] = 7;
             g.region_count[1] = 255;
             g.region_count[2] = 255;
@@ -211,24 +208,24 @@ fn l3ReadSideInfo(bs: *BitStream, gr: []GrInfo, hdr: []const u8) i32 {
                     g.n_short_sfb = 30;
                 }
             }
-            tables = bs.getBits(10) << 5;
-            g.subblock_gain[0] = @intCast(bs.getBits(3));
-            g.subblock_gain[1] = @intCast(bs.getBits(3));
-            g.subblock_gain[2] = @intCast(bs.getBits(3));
+            tables = bs.get_bits(10) << 5;
+            g.subblock_gain[0] = @intCast(bs.get_bits(3));
+            g.subblock_gain[1] = @intCast(bs.get_bits(3));
+            g.subblock_gain[2] = @intCast(bs.get_bits(3));
         } else {
             g.block_type = 0;
             g.mixed_block_flag = 0;
-            tables = bs.getBits(15);
-            g.region_count[0] = @intCast(bs.getBits(4));
-            g.region_count[1] = @intCast(bs.getBits(3));
+            tables = bs.get_bits(15);
+            g.region_count[0] = @intCast(bs.get_bits(4));
+            g.region_count[1] = @intCast(bs.get_bits(3));
             g.region_count[2] = 255;
         }
         g.table_select[0] = @intCast(tables >> 10);
         g.table_select[1] = @intCast((tables >> 5) & 31);
         g.table_select[2] = @intCast(tables & 31);
-        g.preflag = if (mpeg1) @intCast(bs.getBits(1)) else @intFromBool(g.scalefac_compress >= 500);
-        g.scalefac_scale = @intCast(bs.getBits(1));
-        g.count1_table = @intCast(bs.getBits(1));
+        g.preflag = if (mpeg1) @intCast(bs.get_bits(1)) else @intFromBool(g.scalefac_compress >= 500);
+        g.scalefac_scale = @intCast(bs.get_bits(1));
+        g.count1_table = @intCast(bs.get_bits(1));
         g.scfsi = @intCast((scfsi >> 12) & 15);
         scfsi <<= 4;
     }
@@ -237,7 +234,7 @@ fn l3ReadSideInfo(bs: *BitStream, gr: []GrInfo, hdr: []const u8) i32 {
     return main_data_begin;
 }
 
-fn l3ReadScalefactors(scf: []u8, ist_pos: []u8, scf_size: []const u8, scf_count: []const u8, bs: *BitStream, scfsi_in: i32) void {
+fn l3_read_scalefactors(scf: []u8, ist_pos: []u8, scf_size: []const u8, scf_count: []const u8, bs: *BitStream, scfsi_in: i32) void {
     var scfsi = scfsi_in;
     var off: usize = 0;
     var i: usize = 0;
@@ -256,7 +253,7 @@ fn l3ReadScalefactors(scf: []u8, ist_pos: []u8, scf_size: []const u8, scf_count:
             } else {
                 const max_scf: i32 = if (scfsi < 0) (@as(i32, 1) << @intCast(bits)) - 1 else -1;
                 for (0..cnt) |k| {
-                    const s: i32 = @intCast(bs.getBits(bits));
+                    const s: i32 = @intCast(bs.get_bits(bits));
                     ist_pos[off + k] = if (s == max_scf) 255 else @intCast(s);
                     scf[off + k] = @intCast(s);
                 }
@@ -269,7 +266,7 @@ fn l3ReadScalefactors(scf: []u8, ist_pos: []u8, scf_size: []const u8, scf_count:
     scf[off + 2] = 0;
 }
 
-fn l3LdexpQ2(y_in: f32, exp_in: i32) f32 {
+fn l3_ldexp_q2(y_in: f32, exp_in: i32) f32 {
     var y = y_in;
     var exp_q2 = exp_in;
     while (true) {
@@ -282,7 +279,7 @@ fn l3LdexpQ2(y_in: f32, exp_in: i32) f32 {
     return y;
 }
 
-fn l3DecodeScalefactors(hdr: []const u8, ist_pos: []u8, bs: *BitStream, gr: *const GrInfo, scf: []f32, ch: usize) void {
+fn l3_decode_scalefactors(hdr: []const u8, ist_pos: []u8, bs: *BitStream, gr: *const GrInfo, scf: []f32, ch: usize) void {
     const row = @as(usize, @intFromBool(gr.n_short_sfb != 0)) + @intFromBool(gr.n_long_sfb == 0);
     var scf_partition: []const u8 = &SCF_PARTITIONS[row];
     var scf_size: [4]u8 = undefined;
@@ -290,14 +287,14 @@ fn l3DecodeScalefactors(hdr: []const u8, ist_pos: []u8, bs: *BitStream, gr: *con
     const scf_shift: u5 = @intCast(gr.scalefac_scale + 1);
     var scfsi: i32 = gr.scfsi;
 
-    if (hdrTestMpeg1(hdr)) {
+    if (hdr_test_mpeg1(hdr)) {
         const part = SCFC_DECODE[gr.scalefac_compress];
         scf_size[0] = part >> 2;
         scf_size[1] = part >> 2;
         scf_size[2] = part & 3;
         scf_size[3] = part & 3;
     } else {
-        const ist: u32 = @intFromBool(hdrTestIStereo(hdr) and ch != 0);
+        const ist: u32 = @intFromBool(hdr_test_i_stereo(hdr) and ch != 0);
         var sfc: i32 = @intCast(gr.scalefac_compress >> @intCast(ist));
         var k: usize = ist * 3 * 4;
         while (sfc >= 0) {
@@ -315,7 +312,7 @@ fn l3DecodeScalefactors(hdr: []const u8, ist_pos: []u8, bs: *BitStream, gr: *con
         scf_partition = scf_partition[k..];
         scfsi = -16;
     }
-    l3ReadScalefactors(&iscf, ist_pos, &scf_size, scf_partition, bs, scfsi);
+    l3_read_scalefactors(&iscf, ist_pos, &scf_size, scf_partition, bs, scfsi);
 
     const n_long: usize = gr.n_long_sfb;
     if (gr.n_short_sfb != 0) {
@@ -330,14 +327,14 @@ fn l3DecodeScalefactors(hdr: []const u8, ist_pos: []u8, bs: *BitStream, gr: *con
         for (0..10) |i| iscf[11 + i] += PREAMP[i];
     }
 
-    const gain_exp: i32 = @as(i32, gr.global_gain) - 4 - 210 - @as(i32, if (hdrIsMsStereo(hdr)) 2 else 0);
-    const gain = l3LdexpQ2(@floatFromInt(1 << (MAX_SCFI / 4)), MAX_SCFI - gain_exp);
+    const gain_exp: i32 = @as(i32, gr.global_gain) - 4 - 210 - @as(i32, if (hdr_is_ms_stereo(hdr)) 2 else 0);
+    const gain = l3_ldexp_q2(@floatFromInt(1 << (MAX_SCFI / 4)), MAX_SCFI - gain_exp);
     for (0..n_long + gr.n_short_sfb) |i| {
-        scf[i] = l3LdexpQ2(gain, @as(i32, iscf[i]) << scf_shift);
+        scf[i] = l3_ldexp_q2(gain, @as(i32, iscf[i]) << scf_shift);
     }
 }
 
-fn l3Pow43(x_in: i32) f32 {
+fn l3_pow43(x_in: i32) f32 {
     var x = x_in;
     var mult: f32 = 256;
     if (x < 129) return POW43[@intCast(16 + x)];
@@ -370,7 +367,7 @@ const HuffBits = struct {
             self.sh -= 8;
         }
     }
-    inline fn signBit(self: *const HuffBits) u32 {
+    inline fn sign_bit(self: *const HuffBits) u32 {
         return self.cache >> 31;
     }
     fn pos(self: *const HuffBits) i64 {
@@ -378,7 +375,7 @@ const HuffBits = struct {
     }
 };
 
-fn l3Huffman(dst: []f32, bs: *BitStream, full_buf: []const u8, gr: *const GrInfo, scf: []const f32, layer3gr_limit: usize) void {
+fn l3_huffman(dst: []f32, bs: *BitStream, full_buf: []const u8, gr: *const GrInfo, scf: []const f32, layer3gr_limit: usize) void {
     var one: f32 = 0;
     var ireg: usize = 0;
     var big_val_cnt: i32 = gr.big_values;
@@ -422,9 +419,9 @@ fn l3Huffman(dst: []f32, bs: *BitStream, full_buf: []const u8, gr: *const GrInfo
                         lsb += @intCast(hb.peek(linbits));
                         hb.flush(linbits);
                         hb.check();
-                        dst[di] = one * l3Pow43(lsb) * @as(f32, if (hb.signBit() != 0) -1 else 1);
+                        dst[di] = one * l3_pow43(lsb) * @as(f32, if (hb.sign_bit() != 0) -1 else 1);
                     } else {
-                        dst[di] = POW43[@intCast(16 + lsb - 16 * @as(i32, @intCast(hb.signBit())))] * one;
+                        dst[di] = POW43[@intCast(16 + lsb - 16 * @as(i32, @intCast(hb.sign_bit())))] * one;
                     }
                     hb.flush(if (lsb != 0) 1 else 0);
                     di += 1;
@@ -462,7 +459,7 @@ fn l3Huffman(dst: []f32, bs: *BitStream, full_buf: []const u8, gr: *const GrInfo
             for (0..2) |q| {
                 const s = half * 2 + q;
                 if (leaf & (@as(u32, 128) >> @intCast(s)) != 0) {
-                    dst[di + s] = if (hb.signBit() != 0) -one else one;
+                    dst[di + s] = if (hb.sign_bit() != 0) -one else one;
                     hb.flush(1);
                 }
             }
@@ -473,7 +470,7 @@ fn l3Huffman(dst: []f32, bs: *BitStream, full_buf: []const u8, gr: *const GrInfo
     bs.pos = layer3gr_limit;
 }
 
-fn l3MidsideStereo(buf: []f32, off: usize, n: usize) void {
+fn l3_midside_stereo(buf: []f32, off: usize, n: usize) void {
     for (off..off + n) |i| {
         const a = buf[i];
         const b = buf[i + 576];
@@ -482,14 +479,14 @@ fn l3MidsideStereo(buf: []f32, off: usize, n: usize) void {
     }
 }
 
-fn l3IntensityStereoBand(buf: []f32, off: usize, n: usize, kl: f32, kr: f32) void {
+fn l3_intensity_stereo_band(buf: []f32, off: usize, n: usize, kl: f32, kr: f32) void {
     for (off..off + n) |i| {
         buf[i + 576] = buf[i] * kr;
         buf[i] = buf[i] * kl;
     }
 }
 
-fn l3StereoTopBand(right: []const f32, sfb: []const u8, nbands: usize, max_band: *[3]i32) void {
+fn l3_stereo_top_band(right: []const f32, sfb: []const u8, nbands: usize, max_band: *[3]i32) void {
     max_band.* = .{ -1, -1, -1 };
     var off: usize = 0;
     for (0..nbands) |i| {
@@ -504,55 +501,55 @@ fn l3StereoTopBand(right: []const f32, sfb: []const u8, nbands: usize, max_band:
     }
 }
 
-fn l3StereoProcess(buf: []f32, ist_pos: []const u8, sfb: []const u8, hdr: []const u8, max_band: [3]i32, mpeg2_sh: u32) void {
-    const max_pos: u32 = if (hdrTestMpeg1(hdr)) 7 else 64;
+fn l3_stereo_process(buf: []f32, ist_pos: []const u8, sfb: []const u8, hdr: []const u8, max_band: [3]i32, mpeg2_sh: u32) void {
+    const max_pos: u32 = if (hdr_test_mpeg1(hdr)) 7 else 64;
     var off: usize = 0;
     var i: usize = 0;
     while (sfb[i] != 0) : (i += 1) {
         const ipos: u32 = ist_pos[i];
         if (@as(i32, @intCast(i)) > max_band[i % 3] and ipos < max_pos) {
-            const s: f32 = if (hdrTestMsStereo(hdr)) 1.41421356 else 1;
+            const s: f32 = if (hdr_test_ms_stereo(hdr)) 1.41421356 else 1;
             var kl: f32 = undefined;
             var kr: f32 = undefined;
-            if (hdrTestMpeg1(hdr)) {
+            if (hdr_test_mpeg1(hdr)) {
                 kl = PAN[2 * ipos];
                 kr = PAN[2 * ipos + 1];
             } else {
                 kl = 1;
-                kr = l3LdexpQ2(1, @intCast(((ipos + 1) >> 1) << @intCast(mpeg2_sh)));
+                kr = l3_ldexp_q2(1, @intCast(((ipos + 1) >> 1) << @intCast(mpeg2_sh)));
                 if (ipos & 1 != 0) {
                     kl = kr;
                     kr = 1;
                 }
             }
-            l3IntensityStereoBand(buf, off, sfb[i], kl * s, kr * s);
-        } else if (hdrTestMsStereo(hdr)) {
-            l3MidsideStereo(buf, off, sfb[i]);
+            l3_intensity_stereo_band(buf, off, sfb[i], kl * s, kr * s);
+        } else if (hdr_test_ms_stereo(hdr)) {
+            l3_midside_stereo(buf, off, sfb[i]);
         }
         off += sfb[i];
     }
 }
 
-fn l3IntensityStereo(buf: []f32, ist_pos: []u8, gr: []const GrInfo, hdr: []const u8) void {
+fn l3_intensity_stereo(buf: []f32, ist_pos: []u8, gr: []const GrInfo, hdr: []const u8) void {
     var max_band: [3]i32 = undefined;
     const n_sfb: usize = @as(usize, gr[0].n_long_sfb) + gr[0].n_short_sfb;
     const max_blocks: usize = if (gr[0].n_short_sfb != 0) 3 else 1;
 
-    l3StereoTopBand(buf[576..], gr[0].sfbtab, n_sfb, &max_band);
+    l3_stereo_top_band(buf[576..], gr[0].sfbtab, n_sfb, &max_band);
     if (gr[0].n_long_sfb != 0) {
         const m = @max(@max(max_band[0], max_band[1]), max_band[2]);
         max_band = .{ m, m, m };
     }
     for (0..max_blocks) |i| {
-        const default_pos: u8 = if (hdrTestMpeg1(hdr)) 3 else 0;
+        const default_pos: u8 = if (hdr_test_mpeg1(hdr)) 3 else 0;
         const itop = n_sfb - max_blocks + i;
         const prev = itop - max_blocks;
         ist_pos[itop] = if (max_band[i] >= @as(i32, @intCast(prev))) default_pos else ist_pos[prev];
     }
-    l3StereoProcess(buf, ist_pos, gr[0].sfbtab, hdr, max_band, gr[1].scalefac_compress & 1);
+    l3_stereo_process(buf, ist_pos, gr[0].sfbtab, hdr, max_band, gr[1].scalefac_compress & 1);
 }
 
-fn l3Reorder(grbuf: []f32, sfb: []const u8) void {
+fn l3_reorder(grbuf: []f32, sfb: []const u8) void {
     var scratch: [576]f32 = undefined;
     var src: usize = 0;
     var dst: usize = 0;
@@ -571,7 +568,7 @@ fn l3Reorder(grbuf: []f32, sfb: []const u8) void {
     @memcpy(grbuf[0..dst], scratch[0..dst]);
 }
 
-fn l3Antialias(grbuf: []f32, nbands_in: i32) void {
+fn l3_antialias(grbuf: []f32, nbands_in: i32) void {
     var nb = nbands_in;
     var off: usize = 0;
     while (nb > 0) : ({
@@ -587,7 +584,7 @@ fn l3Antialias(grbuf: []f32, nbands_in: i32) void {
     }
 }
 
-fn l3Dct3_9(y: *[9]f32) void {
+fn l3_dct3_9(y: *[9]f32) void {
     var s0 = y[0];
     var s2 = y[2];
     var s4 = y[4];
@@ -631,7 +628,7 @@ fn l3Dct3_9(y: *[9]f32) void {
     y[8] = s4 + s7;
 }
 
-fn l3Imdct36(grbuf: []f32, overlap: []f32, window: *const [18]f32, nbands: usize) void {
+fn l3_imdct36(grbuf: []f32, overlap: []f32, window: *const [18]f32, nbands: usize) void {
     for (0..nbands) |j| {
         const g = j * 18;
         const o = j * 9;
@@ -645,8 +642,8 @@ fn l3Imdct36(grbuf: []f32, overlap: []f32, window: *const [18]f32, nbands: usize
             si[7 - 2 * i] = grbuf[g + 4 * i + 4] - grbuf[g + 4 * i + 3];
             co[2 + 2 * i] = -(grbuf[g + 4 * i + 3] + grbuf[g + 4 * i + 4]);
         }
-        l3Dct3_9(&co);
-        l3Dct3_9(&si);
+        l3_dct3_9(&co);
+        l3_dct3_9(&si);
         si[1] = -si[1];
         si[3] = -si[3];
         si[5] = -si[5];
@@ -661,7 +658,7 @@ fn l3Imdct36(grbuf: []f32, overlap: []f32, window: *const [18]f32, nbands: usize
     }
 }
 
-fn l3Idct3(x0: f32, x1: f32, x2: f32, dst: *[3]f32) void {
+fn l3_idct3(x0: f32, x1: f32, x2: f32, dst: *[3]f32) void {
     const m1 = x1 * 0.86602540;
     const a1 = x0 - x2 * 0.5;
     dst[1] = x0 + x2;
@@ -669,11 +666,11 @@ fn l3Idct3(x0: f32, x1: f32, x2: f32, dst: *[3]f32) void {
     dst[2] = a1 - m1;
 }
 
-fn l3Imdct12(x: []const f32, dst: []f32, ov: []f32) void {
+fn l3_imdct12(x: []const f32, dst: []f32, ov: []f32) void {
     var co: [3]f32 = undefined;
     var si: [3]f32 = undefined;
-    l3Idct3(-x[0], x[6] + x[3], x[12] + x[9], &co);
-    l3Idct3(x[15], x[12] - x[9], x[6] - x[3], &si);
+    l3_idct3(-x[0], x[6] + x[3], x[12] + x[9], &co);
+    l3_idct3(x[15], x[12] - x[9], x[6] - x[3], &si);
     si[1] = -si[1];
     for (0..3) |i| {
         const ovl = ov[i];
@@ -684,20 +681,20 @@ fn l3Imdct12(x: []const f32, dst: []f32, ov: []f32) void {
     }
 }
 
-fn l3ImdctShort(grbuf: []f32, overlap: []f32, nbands: usize) void {
+fn l3_imdct_short(grbuf: []f32, overlap: []f32, nbands: usize) void {
     for (0..nbands) |b| {
         const g = b * 18;
         const o = b * 9;
         var tmp: [18]f32 = undefined;
         @memcpy(&tmp, grbuf[g..][0..18]);
         @memcpy(grbuf[g..][0..6], overlap[o..][0..6]);
-        l3Imdct12(tmp[0..], grbuf[g + 6 ..][0..6], overlap[o + 6 ..][0..3]);
-        l3Imdct12(tmp[1..], grbuf[g + 12 ..][0..6], overlap[o + 6 ..][0..3]);
-        l3Imdct12(tmp[2..], overlap[o..][0..6], overlap[o + 6 ..][0..3]);
+        l3_imdct12(tmp[0..], grbuf[g + 6 ..][0..6], overlap[o + 6 ..][0..3]);
+        l3_imdct12(tmp[1..], grbuf[g + 12 ..][0..6], overlap[o + 6 ..][0..3]);
+        l3_imdct12(tmp[2..], overlap[o..][0..6], overlap[o + 6 ..][0..3]);
     }
 }
 
-fn l3ChangeSign(grbuf: []f32) void {
+fn l3_change_sign(grbuf: []f32) void {
     var b: usize = 1;
     while (b < 32) : (b += 2) {
         var i: usize = 1;
@@ -705,18 +702,18 @@ fn l3ChangeSign(grbuf: []f32) void {
     }
 }
 
-fn l3ImdctGr(grbuf: []f32, overlap: []f32, block_type: u8, n_long_bands: usize) void {
-    if (n_long_bands != 0) l3Imdct36(grbuf, overlap, &MDCT_WINDOW[0], n_long_bands);
+fn l3_imdct_gr(grbuf: []f32, overlap: []f32, block_type: u8, n_long_bands: usize) void {
+    if (n_long_bands != 0) l3_imdct36(grbuf, overlap, &MDCT_WINDOW[0], n_long_bands);
     const g = 18 * n_long_bands;
     const o = 9 * n_long_bands;
     if (block_type == SHORT_BLOCK_TYPE) {
-        l3ImdctShort(grbuf[g..], overlap[o..], 32 - n_long_bands);
+        l3_imdct_short(grbuf[g..], overlap[o..], 32 - n_long_bands);
     } else {
-        l3Imdct36(grbuf[g..], overlap[o..], &MDCT_WINDOW[@intFromBool(block_type == STOP_BLOCK_TYPE)], 32 - n_long_bands);
+        l3_imdct36(grbuf[g..], overlap[o..], &MDCT_WINDOW[@intFromBool(block_type == STOP_BLOCK_TYPE)], 32 - n_long_bands);
     }
 }
 
-fn dctII(grbuf: []f32, n: usize) void {
+fn dct_ii(grbuf: []f32, n: usize) void {
     for (0..n) |k| {
         var t: [4][8]f32 = undefined;
         for (0..8) |i| {
@@ -790,7 +787,7 @@ fn dctII(grbuf: []f32, n: usize) void {
 
 const PCM_SCALE: f32 = 1.0 / 32768.0;
 
-fn synthPair(pcm: []f32, p: usize, nch: usize, z: []const f32, zo: usize) void {
+fn synth_pair(pcm: []f32, p: usize, nch: usize, z: []const f32, zo: usize) void {
     var a: f32 = (z[zo + 14 * 64] - z[zo]) * 29;
     a += (z[zo + 1 * 64] + z[zo + 13 * 64]) * 213;
     a += (z[zo + 12 * 64] - z[zo + 2 * 64]) * 459;
@@ -828,10 +825,10 @@ fn synth(grbuf: []const f32, xl: usize, pcm: []f32, dstl: usize, nch: usize, lin
     lins[zlin + 4 * 31 + 2] = grbuf[xl + 1];
     lins[zlin + 4 * 31 + 3] = grbuf[xr + 1];
 
-    synthPair(pcm, dstr, nch, lins, lo + 4 * 15 + 1);
-    synthPair(pcm, dstr + 32 * nch, nch, lins, lo + 4 * 15 + 64 + 1);
-    synthPair(pcm, dstl, nch, lins, lo + 4 * 15);
-    synthPair(pcm, dstl + 32 * nch, nch, lins, lo + 4 * 15 + 64);
+    synth_pair(pcm, dstr, nch, lins, lo + 4 * 15 + 1);
+    synth_pair(pcm, dstr + 32 * nch, nch, lins, lo + 4 * 15 + 64 + 1);
+    synth_pair(pcm, dstl, nch, lins, lo + 4 * 15);
+    synth_pair(pcm, dstl + 32 * nch, nch, lins, lo + 4 * 15 + 64);
 
     var wi: usize = 0;
     var ii: usize = 15;
@@ -880,8 +877,8 @@ fn synth(grbuf: []const f32, xl: usize, pcm: []f32, dstl: usize, nch: usize, lin
     }
 }
 
-fn synthGranule(qmf_state: []f32, grbuf: []f32, nbands: usize, nch: usize, pcm: []f32, pcm_off: usize, lins: []f32) void {
-    for (0..nch) |ch| dctII(grbuf[576 * ch ..], nbands);
+fn synth_granule(qmf_state: []f32, grbuf: []f32, nbands: usize, nch: usize, pcm: []f32, pcm_off: usize, lins: []f32) void {
+    for (0..nch) |ch| dct_ii(grbuf[576 * ch ..], nbands);
     @memcpy(lins[0 .. 15 * 64], qmf_state[0 .. 15 * 64]);
     var i: usize = 0;
     while (i < nbands) : (i += 2) {
@@ -895,36 +892,36 @@ fn synthGranule(qmf_state: []f32, grbuf: []f32, nbands: usize, nch: usize, pcm: 
     }
 }
 
-fn matchFrame(hdr: []const u8, frame_bytes: usize) bool {
+fn match_frame(hdr: []const u8, frame_bytes: usize) bool {
     var i: usize = 0;
     for (0..MAX_FRAME_SYNC_MATCHES) |nmatch| {
-        i += hdrFrameBytes(hdr[i..], frame_bytes) + hdrPadding(hdr[i..]);
+        i += hdr_frame_bytes(hdr[i..], frame_bytes) + hdr_padding(hdr[i..]);
         if (i + HDR_SIZE > hdr.len) return nmatch > 0;
-        if (!hdrCompare(hdr, hdr[i..])) return false;
+        if (!hdr_compare(hdr, hdr[i..])) return false;
     }
     return true;
 }
 
-fn findFrame(mp3: []const u8, free_format_bytes: *usize, ptr_frame_bytes: *usize) usize {
+fn find_frame(mp3: []const u8, free_format_bytes: *usize, ptr_frame_bytes: *usize) usize {
     var i: usize = 0;
     while (i + HDR_SIZE < mp3.len) : (i += 1) {
         const h = mp3[i..];
-        if (!hdrValid(h)) continue;
-        var frame_bytes = hdrFrameBytes(h, free_format_bytes.*);
-        var frame_and_padding = frame_bytes + hdrPadding(h);
+        if (!hdr_valid(h)) continue;
+        var frame_bytes = hdr_frame_bytes(h, free_format_bytes.*);
+        var frame_and_padding = frame_bytes + hdr_padding(h);
 
         var k: usize = HDR_SIZE;
         while (frame_bytes == 0 and k < MAX_FREE_FORMAT_FRAME_SIZE and i + 2 * k + HDR_SIZE < mp3.len) : (k += 1) {
-            if (hdrCompare(h, h[k..])) {
-                const fb = k - hdrPadding(h);
-                const nextfb = fb + hdrPadding(h[k..]);
-                if (i + k + nextfb + HDR_SIZE > mp3.len or !hdrCompare(h, h[k + nextfb ..])) continue;
+            if (hdr_compare(h, h[k..])) {
+                const fb = k - hdr_padding(h);
+                const nextfb = fb + hdr_padding(h[k..]);
+                if (i + k + nextfb + HDR_SIZE > mp3.len or !hdr_compare(h, h[k + nextfb ..])) continue;
                 frame_and_padding = k;
                 frame_bytes = fb;
                 free_format_bytes.* = fb;
             }
         }
-        if ((frame_bytes != 0 and i + frame_and_padding <= mp3.len and matchFrame(h, frame_bytes)) or
+        if ((frame_bytes != 0 and i + frame_and_padding <= mp3.len and match_frame(h, frame_bytes)) or
             (i == 0 and frame_and_padding == mp3.len))
         {
             ptr_frame_bytes.* = frame_and_padding;
@@ -960,7 +957,7 @@ const Decoder = struct {
         self.header = .{ 0, 0, 0, 0 };
     }
 
-    fn saveReservoir(self: *Decoder) void {
+    fn save_reservoir(self: *Decoder) void {
         var pos: usize = (self.bs.pos + 7) / 8;
         const limit_bytes = self.bs.limit / 8;
         if (pos >= limit_bytes) {
@@ -976,7 +973,7 @@ const Decoder = struct {
         self.reserv = remains;
     }
 
-    fn restoreReservoir(self: *Decoder, bs: *const BitStream, main_data_begin: usize) bool {
+    fn restore_reservoir(self: *Decoder, bs: *const BitStream, main_data_begin: usize) bool {
         const frame_bytes = (bs.limit - bs.pos) / 8;
         const bytes_have = @min(self.reserv, main_data_begin);
         const from = if (self.reserv > main_data_begin) self.reserv - main_data_begin else 0;
@@ -986,50 +983,50 @@ const Decoder = struct {
         return self.reserv >= main_data_begin;
     }
 
-    fn l3Decode(self: *Decoder, nch: usize, gr_base: usize) void {
+    fn l3_decode(self: *Decoder, nch: usize, gr_base: usize) void {
         const hdr: []const u8 = &self.header;
         for (0..nch) |ch| {
             const gr = &self.gr_info[gr_base + ch];
             const limit = self.bs.pos + gr.part_23_length;
-            l3DecodeScalefactors(hdr, &self.ist_pos[ch], &self.bs, gr, &self.scf, ch);
-            l3Huffman(self.grbuf[ch * 576 ..][0..576], &self.bs, &self.maindata, gr, &self.scf, limit);
+            l3_decode_scalefactors(hdr, &self.ist_pos[ch], &self.bs, gr, &self.scf, ch);
+            l3_huffman(self.grbuf[ch * 576 ..][0..576], &self.bs, &self.maindata, gr, &self.scf, limit);
         }
 
-        if (hdrTestIStereo(hdr)) {
-            l3IntensityStereo(&self.grbuf, &self.ist_pos[1], self.gr_info[gr_base..], hdr);
-        } else if (hdrIsMsStereo(hdr)) {
-            l3MidsideStereo(&self.grbuf, 0, 576);
+        if (hdr_test_i_stereo(hdr)) {
+            l3_intensity_stereo(&self.grbuf, &self.ist_pos[1], self.gr_info[gr_base..], hdr);
+        } else if (hdr_is_ms_stereo(hdr)) {
+            l3_midside_stereo(&self.grbuf, 0, 576);
         }
 
         for (0..nch) |ch| {
             const gr = &self.gr_info[gr_base + ch];
             var aa_bands: i32 = 31;
-            const n_long_bands: usize = @as(usize, if (gr.mixed_block_flag != 0) 2 else 0) << @intFromBool(hdrMySampleRate(hdr) == 2);
+            const n_long_bands: usize = @as(usize, if (gr.mixed_block_flag != 0) 2 else 0) << @intFromBool(hdr_my_sample_rate(hdr) == 2);
             const buf = self.grbuf[ch * 576 ..][0..576];
             if (gr.n_short_sfb != 0) {
                 aa_bands = @as(i32, @intCast(n_long_bands)) - 1;
-                l3Reorder(buf[n_long_bands * 18 ..], gr.sfbtab[gr.n_long_sfb..]);
+                l3_reorder(buf[n_long_bands * 18 ..], gr.sfbtab[gr.n_long_sfb..]);
             }
-            l3Antialias(buf, aa_bands);
-            l3ImdctGr(buf, &self.mdct_overlap[ch], gr.block_type, n_long_bands);
-            l3ChangeSign(buf);
+            l3_antialias(buf, aa_bands);
+            l3_imdct_gr(buf, &self.mdct_overlap[ch], gr.block_type, n_long_bands);
+            l3_change_sign(buf);
         }
     }
 
     /// Decodes one frame into interleaved `pcm`; returns samples per channel (0 if skipped).
-    fn decodeFrame(self: *Decoder, mp3: []const u8, pcm: []f32, info: *FrameInfo) usize {
+    fn decode_frame(self: *Decoder, mp3: []const u8, pcm: []f32, info: *FrameInfo) usize {
         var i: usize = 0;
         var frame_size: usize = 0;
 
-        if (mp3.len > 4 and self.header[0] == 0xff and hdrCompare(&self.header, mp3)) {
-            frame_size = hdrFrameBytes(mp3, self.free_format_bytes) + hdrPadding(mp3);
-            if (frame_size != mp3.len and (frame_size + HDR_SIZE > mp3.len or !hdrCompare(mp3, mp3[frame_size..]))) {
+        if (mp3.len > 4 and self.header[0] == 0xff and hdr_compare(&self.header, mp3)) {
+            frame_size = hdr_frame_bytes(mp3, self.free_format_bytes) + hdr_padding(mp3);
+            if (frame_size != mp3.len and (frame_size + HDR_SIZE > mp3.len or !hdr_compare(mp3, mp3[frame_size..]))) {
                 frame_size = 0;
             }
         }
         if (frame_size == 0) {
             self.reset();
-            i = findFrame(mp3, &self.free_format_bytes, &frame_size);
+            i = find_frame(mp3, &self.free_format_bytes, &frame_size);
             if (frame_size == 0 or i + frame_size > mp3.len) {
                 info.frame_bytes = i;
                 return 0;
@@ -1041,37 +1038,37 @@ const Decoder = struct {
         info.* = .{
             .frame_bytes = i + frame_size,
             .frame_offset = i,
-            .channels = if (hdrIsMono(hdr)) 1 else 2,
-            .hz = hdrSampleRateHz(hdr),
-            .layer = 4 - hdrLayer(hdr),
-            .bitrate_kbps = hdrBitrateKbps(hdr),
+            .channels = if (hdr_is_mono(hdr)) 1 else 2,
+            .hz = hdr_sample_rate_hz(hdr),
+            .layer = 4 - hdr_layer(hdr),
+            .bitrate_kbps = hdr_bitrate_kbps(hdr),
         };
         if (info.layer != 3) return 0;
 
         var bs_frame = BitStream.init(hdr[HDR_SIZE..frame_size]);
-        if (hdrIsCrc(hdr)) _ = bs_frame.getBits(16);
+        if (hdr_is_crc(hdr)) _ = bs_frame.get_bits(16);
 
-        const main_data_begin = l3ReadSideInfo(&bs_frame, &self.gr_info, hdr);
+        const main_data_begin = l3_read_side_info(&bs_frame, &self.gr_info, hdr);
         if (main_data_begin < 0 or bs_frame.pos > bs_frame.limit) {
             self.header[0] = 0;
             return 0;
         }
         const nch = info.channels;
-        const success = self.restoreReservoir(&bs_frame, @intCast(main_data_begin));
+        const success = self.restore_reservoir(&bs_frame, @intCast(main_data_begin));
         if (success) {
-            const ngr: usize = if (hdrTestMpeg1(hdr)) 2 else 1;
+            const ngr: usize = if (hdr_test_mpeg1(hdr)) 2 else 1;
             for (0..ngr) |igr| {
                 @memset(&self.grbuf, 0);
-                self.l3Decode(nch, igr * nch);
-                synthGranule(&self.qmf_state, &self.grbuf, 18, nch, pcm, igr * 576 * nch, &self.syn);
+                self.l3_decode(nch, igr * nch);
+                synth_granule(&self.qmf_state, &self.grbuf, 18, nch, pcm, igr * 576 * nch, &self.syn);
             }
         }
-        self.saveReservoir();
-        return if (success) hdrFrameSamples(&self.header) else 0;
+        self.save_reservoir();
+        return if (success) hdr_frame_samples(&self.header) else 0;
     }
 };
 
-const Audio = struct {
+pub const Audio = struct {
     /// Interleaved samples, `channels` per frame.
     pcm: []f32,
     channels: usize,
@@ -1079,7 +1076,7 @@ const Audio = struct {
     bitrate_kbps: u32,
 };
 
-fn id3v2Size(data: []const u8) usize {
+fn id3v2_size(data: []const u8) usize {
     if (data.len < 10 or !std.mem.eql(u8, data[0..3], "ID3")) return 0;
     const size = (@as(usize, data[6] & 0x7f) << 21) | (@as(usize, data[7] & 0x7f) << 14) |
         (@as(usize, data[8] & 0x7f) << 7) | (data[9] & 0x7f);
@@ -1088,7 +1085,7 @@ fn id3v2Size(data: []const u8) usize {
 }
 
 /// Encoder delay from the LAME extension of a Xing/Info frame, or null if this is an audio frame.
-fn xingDelay(frame: []const u8) ?usize {
+fn xing_delay(frame: []const u8) ?usize {
     const scan = frame[0..@min(frame.len, 64)];
     const x = std.mem.indexOf(u8, scan, "Xing") orelse std.mem.indexOf(u8, scan, "Info") orelse return null;
     if (x + 8 > frame.len) return 0;
@@ -1102,8 +1099,8 @@ fn xingDelay(frame: []const u8) ?usize {
     return (@as(usize, frame[off + 21]) << 4) | (frame[off + 22] >> 4);
 }
 
-fn decodeMp3(a: Allocator, data_in: []const u8) !Audio {
-    var data = data_in[id3v2Size(data_in)..];
+pub fn decode_mp3(a: Allocator, data_in: []const u8) !Audio {
+    var data = data_in[id3v2_size(data_in)..];
     if (data.len >= 128 and std.mem.eql(u8, data[data.len - 128 ..][0..3], "TAG")) data = data[0 .. data.len - 128];
 
     const dec = try a.create(Decoder);
@@ -1119,7 +1116,7 @@ fn decodeMp3(a: Allocator, data_in: []const u8) !Audio {
     var pos: usize = 0;
 
     while (pos < data.len) {
-        const n = dec.decodeFrame(data[pos..], &pcm, &info);
+        const n = dec.decode_frame(data[pos..], &pcm, &info);
         if (info.frame_bytes == 0) break;
         const frame = data[pos + info.frame_offset .. pos + info.frame_bytes];
         pos += info.frame_bytes;
@@ -1129,7 +1126,7 @@ fn decodeMp3(a: Allocator, data_in: []const u8) !Audio {
             channels = info.channels;
             rate = info.hz;
             bitrate = info.bitrate_kbps;
-            if (xingDelay(frame)) |delay| {
+            if (xing_delay(frame)) |delay| {
                 skip = if (delay > 0) delay + 529 else 0;
                 continue;
             }
@@ -1155,7 +1152,7 @@ fn decodeMp3(a: Allocator, data_in: []const u8) !Audio {
     return .{ .pcm = try out.toOwnedSlice(a), .channels = channels, .rate = rate, .bitrate_kbps = bitrate };
 }
 
-fn writeWav(io: std.Io, path: []const u8, audio: Audio) !void {
+pub fn write_wav(io: std.Io, path: []const u8, audio: Audio) !void {
     const file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
     var buf: [16384]u8 = undefined;
@@ -1221,8 +1218,8 @@ const MID_ONSET_HI = 5000.0;
 const BASS_SNAP_FRAMES = 6;
 const MID_SNAP_FRAMES = 3;
 
-const TEMPO_MIN = 60.0;
-const TEMPO_MAX = 200.0;
+pub const TEMPO_MIN = 60.0;
+pub const TEMPO_MAX = 200.0;
 const TEMPO_PRIOR_BPM = 120.0;
 const TEMPO_PRIOR_OCTAVES = 0.6;
 const TEMPO_HINT_OCTAVES = 0.25;
@@ -1230,8 +1227,8 @@ const BEAT_TIGHTNESS = 100.0;
 
 const DRUM_DELTA = 1.2;
 const DRUM_MIN_GAP = 3;
-const DrumBand = struct { name: []const u8, lo: f32, hi: f32 };
-const DRUM_BANDS = [_]DrumBand{
+pub const DrumBand = struct { name: []const u8, lo: f32, hi: f32 };
+pub const DRUM_BANDS = [_]DrumBand{
     .{ .name = "kick", .lo = 40, .hi = 120 },
     .{ .name = "snare", .lo = 1500, .hi = 5000 },
     .{ .name = "hihat", .lo = 7000, .hi = 11000 },
@@ -1328,7 +1325,7 @@ fn stft(a: Allocator, x: []const f32, n: usize, max_hz: f32, rate: f32) !Spec {
     return spec;
 }
 
-fn slidingMedian(src: []const f32, dst: []f32, half: usize, win: []f32) void {
+fn sliding_median(src: []const f32, dst: []f32, half: usize, win: []f32) void {
     const n = src.len;
     const w = 2 * half + 1;
     const at = struct {
@@ -1364,10 +1361,10 @@ fn hpss(a: Allocator, s: Spec) !struct { harm: Spec, perc: Spec } {
 
     for (0..s.bins) |k| {
         for (0..s.frames) |t| col[t] = s.data[t * s.bins + k];
-        slidingMedian(col, med, HPSS_HALF, &win);
+        sliding_median(col, med, HPSS_HALF, &win);
         for (0..s.frames) |t| harm.data[t * s.bins + k] = med[t];
     }
-    for (0..s.frames) |t| slidingMedian(s.row(t), perc.row(t), HPSS_HALF, &win);
+    for (0..s.frames) |t| sliding_median(s.row(t), perc.row(t), HPSS_HALF, &win);
 
     for (s.data, harm.data, perc.data) |x, *h, *p| {
         const h2 = h.* * h.*;
@@ -1379,7 +1376,7 @@ fn hpss(a: Allocator, s: Spec) !struct { harm: Spec, perc: Spec } {
     return .{ .harm = harm, .perc = perc };
 }
 
-fn maxOf(xs: []const f32) f32 {
+fn max_of(xs: []const f32) f32 {
     var m: f32 = 0;
     for (xs) |x| m = @max(m, x);
     return m;
@@ -1395,25 +1392,25 @@ fn percentile(a: Allocator, xs: []const f32, q: f32) !f32 {
     return tmp.items[idx];
 }
 
-fn logCompress(a: Allocator, s: Spec) !Spec {
+fn log_compress(a: Allocator, s: Spec) !Spec {
     var out = s;
     out.data = try a.alloc(f32, s.data.len);
-    const g = LOG_GAIN / @max(maxOf(s.data), 1e-12);
+    const g = LOG_GAIN / @max(max_of(s.data), 1e-12);
     for (s.data, out.data) |x, *o| o.* = @log(1 + g * x);
     return out;
 }
 
-fn hzToBin(hz: f32, n: usize, rate: f32) f32 {
+fn hz_to_bin(hz: f32, n: usize, rate: f32) f32 {
     return hz * @as(f32, @floatFromInt(n)) / rate;
 }
 
-fn midiHz(p: f32) f32 {
+fn midi_hz(p: f32) f32 {
     return 440.0 * std.math.pow(f32, 2.0, (p - 69.0) / 12.0);
 }
 
 // ---------------------------------------------------------------- tempo / beats
 
-fn onsetEnvelope(a: Allocator, logspec: Spec) ![]f32 {
+fn onset_envelope(a: Allocator, logspec: Spec) ![]f32 {
     const env = try a.alloc(f32, logspec.frames);
     env[0] = 0;
     for (1..logspec.frames) |t| {
@@ -1433,38 +1430,45 @@ fn onsetEnvelope(a: Allocator, logspec: Spec) ![]f32 {
         m /= @floatFromInt(hi - lo);
         smooth[t] = @max(0, env[t] - m);
     }
-    const peak = maxOf(smooth);
+    const peak = max_of(smooth);
     if (peak > 0) for (smooth) |*v| {
         v.* /= peak;
     };
     return smooth;
 }
 
-fn sampleAt(xs: []const f32, pos: f32) f32 {
+fn sample_at(xs: []const f32, pos: f32) f32 {
     const i: usize = @intFromFloat(pos);
     if (i + 1 >= xs.len) return 0;
     const f = pos - @as(f32, @floatFromInt(i));
     return xs[i] * (1 - f) + xs[i + 1] * f;
 }
 
-fn autocorrAt(env: []const f32, lag: f32) f32 {
+fn autocorr_at(env: []const f32, lag: f32) f32 {
     var sum: f32 = 0;
     const span: usize = @intFromFloat(@ceil(lag));
     if (span + 1 >= env.len) return 0;
-    for (0..env.len - span - 1) |t| sum += env[t] * sampleAt(env, @as(f32, @floatFromInt(t)) + lag);
+    for (0..env.len - span - 1) |t| sum += env[t] * sample_at(env, @as(f32, @floatFromInt(t)) + lag);
     return sum / @as(f32, @floatFromInt(env.len - span));
 }
 
-const TempoPrior = struct { center: f32, octaves: f32 };
+pub const TempoPrior = struct { center: f32, octaves: f32 };
 
-fn estimateTempo(env: []const f32, fps: f32, prior_cfg: TempoPrior) f32 {
+pub fn tempo_prior(bpm_hint: ?f32) TempoPrior {
+    return if (bpm_hint) |h|
+        .{ .center = h, .octaves = TEMPO_HINT_OCTAVES }
+    else
+        .{ .center = TEMPO_PRIOR_BPM, .octaves = TEMPO_PRIOR_OCTAVES };
+}
+
+fn estimate_tempo(env: []const f32, fps: f32, prior_cfg: TempoPrior) f32 {
     var best_bpm: f32 = prior_cfg.center;
     var best: f32 = -1;
     var bpm: f32 = TEMPO_MIN;
     while (bpm <= TEMPO_MAX) : (bpm += 0.5) {
         const lag = fps * 60.0 / bpm;
         const prior = @exp(-0.5 * std.math.pow(f32, @log2(bpm / prior_cfg.center) / prior_cfg.octaves, 2));
-        const score = autocorrAt(env, lag) * prior;
+        const score = autocorr_at(env, lag) * prior;
         if (score > best) {
             best = score;
             best_bpm = bpm;
@@ -1474,7 +1478,7 @@ fn estimateTempo(env: []const f32, fps: f32, prior_cfg: TempoPrior) f32 {
 }
 
 /// Precise tempo from a least-squares line through the tracked beat times.
-fn beatGridBpm(a: Allocator, beats: []const f32) !?f32 {
+fn beat_grid_bpm(a: Allocator, beats: []const f32) !?f32 {
     if (beats.len < 8) return null;
     const ibi = try a.alloc(f32, beats.len - 1);
     for (ibi, 0..) |*d, i| d.* = beats[i + 1] - beats[i];
@@ -1498,7 +1502,7 @@ fn beatGridBpm(a: Allocator, beats: []const f32) !?f32 {
 }
 
 /// Dynamic-programming beat tracker (Ellis 2007); returns beat frame indices.
-fn trackBeats(a: Allocator, env: []const f32, fps: f32, bpm: f32) ![]usize {
+fn track_beats(a: Allocator, env: []const f32, fps: f32, bpm: f32) ![]usize {
     const period = fps * 60.0 / bpm;
     const n = env.len;
     const score = try a.alloc(f32, n);
@@ -1548,15 +1552,15 @@ fn trackBeats(a: Allocator, env: []const f32, fps: f32, bpm: f32) ![]usize {
 
 // ---------------------------------------------------------------- drums
 
-const Hit = struct { time: f32, velocity: f32 };
+pub const Hit = struct { time: f32, velocity: f32 };
 
 const Peak = struct { frame: usize, strength: f32 };
 
 /// Spectral-flux onset peaks within a frequency band; strength is relative to the 99th percentile.
-fn bandOnsets(a: Allocator, log_spec: Spec, lo_hz: f32, hi_hz: f32, rate: f32, delta: f32) ![]Peak {
+fn band_onsets(a: Allocator, log_spec: Spec, lo_hz: f32, hi_hz: f32, rate: f32, delta: f32) ![]Peak {
     const n = log_spec.frames;
-    const lo: usize = @intFromFloat(@floor(hzToBin(lo_hz, log_spec.n, rate)));
-    const hi: usize = @min(log_spec.bins, @as(usize, @intFromFloat(@ceil(hzToBin(hi_hz, log_spec.n, rate)))) + 1);
+    const lo: usize = @intFromFloat(@floor(hz_to_bin(lo_hz, log_spec.n, rate)));
+    const hi: usize = @min(log_spec.bins, @as(usize, @intFromFloat(@ceil(hz_to_bin(hi_hz, log_spec.n, rate)))) + 1);
     if (lo + 1 >= hi) return &.{};
     const odf = try a.alloc(f32, n);
     odf[0] = 0;
@@ -1594,14 +1598,14 @@ fn bandOnsets(a: Allocator, log_spec: Spec, lo_hz: f32, hi_hz: f32, rate: f32, d
     return peaks.items;
 }
 
-fn detectDrums(a: Allocator, perc_log: Spec, band: DrumBand, rate: f32, fps: f32) ![]Hit {
-    const peaks = try bandOnsets(a, perc_log, band.lo, band.hi, rate, DRUM_DELTA);
+fn detect_drums(a: Allocator, perc_log: Spec, band: DrumBand, rate: f32, fps: f32) ![]Hit {
+    const peaks = try band_onsets(a, perc_log, band.lo, band.hi, rate, DRUM_DELTA);
     const hits = try a.alloc(Hit, peaks.len);
     for (peaks, hits) |p, *h| h.* = .{ .time = @as(f32, @floatFromInt(p.frame)) / fps, .velocity = p.strength };
     return hits;
 }
 
-fn onsetMask(a: Allocator, peaks: []const Peak, frames: usize) ![]bool {
+fn onset_mask(a: Allocator, peaks: []const Peak, frames: usize) ![]bool {
     const mask = try a.alloc(bool, frames);
     @memset(mask, false);
     for (peaks) |p| if (p.frame < frames) {
@@ -1622,10 +1626,10 @@ const PitchTable = struct {
         var t: PitchTable = undefined;
         const tol_ratio = std.math.pow(f32, 2.0, PITCH_TOL_SEMIS / 12.0) - 1;
         for (0..NP) |pi| {
-            const f0 = midiHz(@floatFromInt(MIDI_LO + pi));
+            const f0 = midi_hz(@floatFromInt(MIDI_LO + pi));
             var nh: u8 = 0;
             for (0..HARMONICS) |h| {
-                const c = hzToBin(f0 * @as(f32, @floatFromInt(h + 1)), n, rate);
+                const c = hz_to_bin(f0 * @as(f32, @floatFromInt(h + 1)), n, rate);
                 const tol = @max(0.5, c * tol_ratio);
                 const lo = @ceil(c - tol);
                 const hi = @floor(c + tol);
@@ -1674,14 +1678,14 @@ const PitchTable = struct {
 
 const Voice = struct { pitch: u8 = 0, sal: f32 = 0 };
 
-const Note = struct {
+pub const Note = struct {
     start: f32,
     end: f32,
     pitch: u8,
     velocity: f32,
 };
 
-fn lessNote(_: void, x: Note, y: Note) bool {
+fn less_note(_: void, x: Note, y: Note) bool {
     return if (x.start != y.start) x.start < y.start else x.pitch < y.pitch;
 }
 
@@ -1692,7 +1696,7 @@ const NoteOnsets = struct {
 };
 
 /// Turns a per-frame pitch track (0 = silent) into notes, splitting repeated notes at onsets.
-fn trackNotes(a: Allocator, out: *std.ArrayList(Note), pitch: []const u8, sal: []const f32, ref: f32, fps: f32, onsets: NoteOnsets) !void {
+fn track_notes(a: Allocator, out: *std.ArrayList(Note), pitch: []const u8, sal: []const f32, ref: f32, fps: f32, onsets: NoteOnsets) !void {
     const n = pitch.len;
     var t: usize = 0;
     while (t < n) {
@@ -1736,7 +1740,7 @@ fn trackNotes(a: Allocator, out: *std.ArrayList(Note), pitch: []const u8, sal: [
     }
 }
 
-fn smoothTrack(pitch: []u8) void {
+fn smooth_track(pitch: []u8) void {
     if (pitch.len < 3) return;
     for (1..pitch.len - 1) |t| {
         if (pitch[t - 1] == pitch[t + 1] and pitch[t] != pitch[t - 1] and pitch[t - 1] != 0) pitch[t] = pitch[t - 1];
@@ -1745,7 +1749,7 @@ fn smoothTrack(pitch: []u8) void {
 
 const PitchedResult = struct { bass: []Note, melody: []Note, harmony: []Note };
 
-fn transcribePitched(a: Allocator, mid_log: Spec, bass_log: Spec, rate: f32, fps: f32, bass_on: NoteOnsets, mid_on: NoteOnsets) !PitchedResult {
+fn transcribe_pitched(a: Allocator, mid_log: Spec, bass_log: Spec, rate: f32, fps: f32, bass_on: NoteOnsets, mid_on: NoteOnsets) !PitchedResult {
     const frames = @min(mid_log.frames, bass_log.frames);
     const mid_tab = PitchTable.build(mid_log.n, rate, mid_log.bins);
     const bass_tab = PitchTable.build(bass_log.n, rate, bass_log.bins);
@@ -1810,14 +1814,14 @@ fn transcribePitched(a: Allocator, mid_log: Spec, bass_log: Spec, rate: f32, fps
         s.* = if (ok) v[0].sal else 0;
     }
 
-    smoothTrack(bass_pitch);
-    smoothTrack(mel_pitch);
+    smooth_track(bass_pitch);
+    smooth_track(mel_pitch);
 
     var bass: std.ArrayList(Note) = .empty;
     var melody: std.ArrayList(Note) = .empty;
     var harmony: std.ArrayList(Note) = .empty;
-    try trackNotes(a, &bass, bass_pitch, bass_sal, try percentile(a, bass_sal, 0.95), fps, bass_on);
-    try trackNotes(a, &melody, mel_pitch, mel_sal, try percentile(a, mel_sal, 0.95), fps, mid_on);
+    try track_notes(a, &bass, bass_pitch, bass_sal, try percentile(a, bass_sal, 0.95), fps, bass_on);
+    try track_notes(a, &melody, mel_pitch, mel_sal, try percentile(a, mel_sal, 0.95), fps, mid_on);
 
     const hp = try a.alloc(u8, frames);
     const hs = try a.alloc(f32, frames);
@@ -1833,10 +1837,10 @@ fn transcribePitched(a: Allocator, mid_log: Spec, bass_log: Spec, rate: f32, fps
             };
         }
         if (!any) continue;
-        smoothTrack(hp);
-        try trackNotes(a, &harmony, hp, hs, voice_ref, fps, mid_on);
+        smooth_track(hp);
+        try track_notes(a, &harmony, hp, hs, voice_ref, fps, mid_on);
     }
-    std.mem.sort(Note, harmony.items, {}, lessNote);
+    std.mem.sort(Note, harmony.items, {}, less_note);
     return .{ .bass = bass.items, .melody = melody.items, .harmony = harmony.items };
 }
 
@@ -1846,9 +1850,9 @@ const NOTE_NAMES = [_][]const u8{ "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#
 const KEY_MAJOR = [12]f32{ 6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88 };
 const KEY_MINOR = [12]f32{ 6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17 };
 
-const Chord = struct { start: f32, end: f32, root: u8, minor: bool, none: bool };
+pub const Chord = struct { start: f32, end: f32, root: u8, minor: bool, none: bool };
 
-fn frameChroma(row: []const f32, n: usize, rate: f32, out: *[12]f32) void {
+fn frame_chroma(row: []const f32, n: usize, rate: f32, out: *[12]f32) void {
     out.* = @splat(0);
     for (row, 0..) |v, k| {
         const hz = @as(f32, @floatFromInt(k)) * rate / @as(f32, @floatFromInt(n));
@@ -1879,7 +1883,7 @@ fn pearson(x: [12]f32, y: [12]f32) f32 {
     return sxy / @sqrt(sxx * syy + 1e-12);
 }
 
-fn estimateChords(a: Allocator, mid_log: Spec, rate: f32, beats: []const usize, fps: f32, total: *[12]f32) ![]Chord {
+fn estimate_chords(a: Allocator, mid_log: Spec, rate: f32, beats: []const usize, fps: f32, total: *[12]f32) ![]Chord {
     total.* = @splat(0);
     var raw: std.ArrayList(Chord) = .empty;
     var energies: std.ArrayList(f32) = .empty;
@@ -1890,7 +1894,7 @@ fn estimateChords(a: Allocator, mid_log: Spec, rate: f32, beats: []const usize, 
         seg = @splat(0);
         for (beats[b]..beats[b + 1]) |t| {
             if (t >= mid_log.frames) break;
-            frameChroma(mid_log.row(t), mid_log.n, rate, &c);
+            frame_chroma(mid_log.row(t), mid_log.n, rate, &c);
             for (0..12) |i| seg[i] += c[i];
         }
         var energy: f32 = 0;
@@ -1932,7 +1936,7 @@ fn estimateChords(a: Allocator, mid_log: Spec, rate: f32, beats: []const usize, 
     const items = raw.items;
     if (items.len >= 3) {
         for (1..items.len - 1) |i| {
-            if (sameChord(items[i - 1], items[i + 1]) and !sameChord(items[i], items[i - 1])) {
+            if (same_chord(items[i - 1], items[i + 1]) and !same_chord(items[i], items[i - 1])) {
                 items[i].root = items[i - 1].root;
                 items[i].minor = items[i - 1].minor;
                 items[i].none = items[i - 1].none;
@@ -1941,19 +1945,19 @@ fn estimateChords(a: Allocator, mid_log: Spec, rate: f32, beats: []const usize, 
     }
     var merged: std.ArrayList(Chord) = .empty;
     for (items) |ch| {
-        if (merged.items.len > 0 and sameChord(merged.items[merged.items.len - 1], ch)) {
+        if (merged.items.len > 0 and same_chord(merged.items[merged.items.len - 1], ch)) {
             merged.items[merged.items.len - 1].end = ch.end;
         } else try merged.append(a, ch);
     }
     return merged.items;
 }
 
-fn sameChord(x: Chord, y: Chord) bool {
+fn same_chord(x: Chord, y: Chord) bool {
     if (x.none or y.none) return x.none == y.none;
     return x.root == y.root and x.minor == y.minor;
 }
 
-fn estimateKey(total: [12]f32) struct { root: usize, minor: bool } {
+fn estimate_key(total: [12]f32) struct { root: usize, minor: bool } {
     var best: f32 = -2;
     var root: usize = 0;
     var minor = false;
@@ -1982,7 +1986,7 @@ fn estimateKey(total: [12]f32) struct { root: usize, minor: bool } {
 
 // ---------------------------------------------------------------- pipeline
 
-fn toMono(a: Allocator, audio: Audio) ![]f32 {
+fn to_mono(a: Allocator, audio: Audio) ![]f32 {
     const frames = audio.pcm.len / audio.channels;
     const mono = try a.alloc(f32, frames);
     for (mono, 0..) |*m, i| {
@@ -2024,7 +2028,7 @@ fn downsample(a: Allocator, x: []const f32, factor: usize) ![]f32 {
     return out;
 }
 
-const Analysis = struct {
+pub const Analysis = struct {
     duration: f32,
     bpm: f32,
     beats: []f32,
@@ -2037,8 +2041,8 @@ const Analysis = struct {
     harmony: []Note,
 };
 
-fn analyze(a: Allocator, audio: Audio, prior: TempoPrior) !Analysis {
-    const mono_full = try toMono(a, audio);
+pub fn analyze(a: Allocator, audio: Audio, prior: TempoPrior) !Analysis {
+    const mono_full = try to_mono(a, audio);
     const factor: usize = @max(1, @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(audio.rate)) / TARGET_RATE))));
     const x = try downsample(a, mono_full, factor);
     const rate = @as(f32, @floatFromInt(audio.rate)) / @as(f32, @floatFromInt(factor));
@@ -2051,12 +2055,12 @@ fn analyze(a: Allocator, audio: Audio, prior: TempoPrior) !Analysis {
     const s_bass = try stft(a, x, N_BASS, BASS_MAX_HZ, rate);
 
     status("tempo + beats", .{});
-    const env = try onsetEnvelope(a, try logCompress(a, s_onset));
-    const tempo = estimateTempo(env, fps, prior);
-    const beat_frames = try trackBeats(a, env, fps, tempo);
+    const env = try onset_envelope(a, try log_compress(a, s_onset));
+    const tempo = estimate_tempo(env, fps, prior);
+    const beat_frames = try track_beats(a, env, fps, tempo);
     const beats = try a.alloc(f32, beat_frames.len);
     for (beat_frames, beats) |b, *t| t.* = @as(f32, @floatFromInt(b)) / fps;
-    const bpm = try beatGridBpm(a, beats) orelse tempo;
+    const bpm = try beat_grid_bpm(a, beats) orelse tempo;
 
     status("harmonic/percussive separation", .{});
     const sep_onset = try hpss(a, s_onset);
@@ -2065,26 +2069,26 @@ fn analyze(a: Allocator, audio: Audio, prior: TempoPrior) !Analysis {
 
     status("drums", .{});
     var drums: [DRUM_BANDS.len][]Hit = undefined;
-    const perc_log = try logCompress(a, sep_onset.perc);
-    for (DRUM_BANDS, 0..) |band, i| drums[i] = try detectDrums(a, perc_log, band, rate, fps);
+    const perc_log = try log_compress(a, sep_onset.perc);
+    for (DRUM_BANDS, 0..) |band, i| drums[i] = try detect_drums(a, perc_log, band, rate, fps);
 
     status("notes", .{});
-    const onset_log = try logCompress(a, s_onset);
+    const onset_log = try log_compress(a, s_onset);
     const bass_on = NoteOnsets{
-        .mask = try onsetMask(a, try bandOnsets(a, onset_log, BASS_ONSET_LO, BASS_ONSET_HI, rate, NOTE_ONSET_DELTA), s_onset.frames),
+        .mask = try onset_mask(a, try band_onsets(a, onset_log, BASS_ONSET_LO, BASS_ONSET_HI, rate, NOTE_ONSET_DELTA), s_onset.frames),
         .snap = BASS_SNAP_FRAMES,
     };
     const mid_on = NoteOnsets{
-        .mask = try onsetMask(a, try bandOnsets(a, onset_log, MID_ONSET_LO, MID_ONSET_HI, rate, NOTE_ONSET_DELTA), s_onset.frames),
+        .mask = try onset_mask(a, try band_onsets(a, onset_log, MID_ONSET_LO, MID_ONSET_HI, rate, NOTE_ONSET_DELTA), s_onset.frames),
         .snap = MID_SNAP_FRAMES,
     };
-    const mid_log = try logCompress(a, sep_mid.harm);
-    const pitched = try transcribePitched(a, mid_log, try logCompress(a, sep_bass.harm), rate, fps, bass_on, mid_on);
+    const mid_log = try log_compress(a, sep_mid.harm);
+    const pitched = try transcribe_pitched(a, mid_log, try log_compress(a, sep_bass.harm), rate, fps, bass_on, mid_on);
 
     status("chords + key", .{});
     var total: [12]f32 = undefined;
-    const chords = try estimateChords(a, mid_log, rate, beat_frames, fps, &total);
-    const key = estimateKey(total);
+    const chords = try estimate_chords(a, mid_log, rate, beat_frames, fps, &total);
+    const key = estimate_key(total);
 
     return .{
         .duration = duration,
@@ -2100,13 +2104,19 @@ fn analyze(a: Allocator, audio: Audio, prior: TempoPrior) !Analysis {
     };
 }
 
+pub fn analyze_file(a: Allocator, io: std.Io, path: []const u8, bpm_hint: ?f32) !struct { audio: Audio, analysis: Analysis } {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 30));
+    const audio = try decode_mp3(a, bytes);
+    return .{ .audio = audio, .analysis = try analyze(a, audio, tempo_prior(bpm_hint)) };
+}
+
 // ---------------------------------------------------------------- report
 
-fn noteName(buf: []u8, midi: u8) []const u8 {
+pub fn note_name(buf: []u8, midi: u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}{d}", .{ NOTE_NAMES[midi % 12], @as(i32, midi / 12) - 1 }) catch "?";
 }
 
-fn activeRatio(notes: []const Note, duration: f32) f32 {
+pub fn active_ratio(notes: []const Note, duration: f32) f32 {
     var sum: f32 = 0;
     for (notes) |n| sum += n.end - n.start;
     return if (duration > 0) @min(1.0, sum / duration) else 0;
@@ -2114,7 +2124,7 @@ fn activeRatio(notes: []const Note, duration: f32) f32 {
 
 const MIN_INSTRUMENT_EVENTS = 8;
 
-fn writeReport(io: std.Io, path: []const u8, source: []const u8, audio: Audio, r: Analysis) !void {
+pub fn write_report(io: std.Io, path: []const u8, source: []const u8, audio: Audio, r: Analysis) !void {
     const file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
     var buf: [8192]u8 = undefined;
@@ -2167,7 +2177,7 @@ fn writeReport(io: std.Io, path: []const u8, source: []const u8, audio: Audio, r
     }
 
     for (pitched) |p| {
-        try w.print("\n[{s}]\ntype=pitched\nrole={s}\nnote_count={d}\nactive_ratio={d:.3}\n", .{ p.name, p.role, p.notes.len, activeRatio(p.notes, r.duration) });
+        try w.print("\n[{s}]\ntype=pitched\nrole={s}\nnote_count={d}\nactive_ratio={d:.3}\n", .{ p.name, p.role, p.notes.len, active_ratio(p.notes, r.duration) });
         if (p.notes.len > 0) {
             var lo: u8 = 255;
             var hi: u8 = 0;
@@ -2175,11 +2185,11 @@ fn writeReport(io: std.Io, path: []const u8, source: []const u8, audio: Audio, r
                 lo = @min(lo, n.pitch);
                 hi = @max(hi, n.pitch);
             }
-            try w.print("range={s}-{s}\n", .{ noteName(&nb1, lo), noteName(&nb2, hi) });
+            try w.print("range={s}-{s}\n", .{ note_name(&nb1, lo), note_name(&nb2, hi) });
         }
         try w.print("# start,end,midi,name,velocity\n", .{});
         for (p.notes) |n| {
-            try w.print("note={d:.3},{d:.3},{d},{s},{d:.2}\n", .{ n.start, n.end, n.pitch, noteName(&nb1, n.pitch), n.velocity });
+            try w.print("note={d:.3},{d:.3},{d},{s},{d:.2}\n", .{ n.start, n.end, n.pitch, note_name(&nb1, n.pitch), n.velocity });
         }
     }
     try w.flush();
@@ -2187,94 +2197,6 @@ fn writeReport(io: std.Io, path: []const u8, source: []const u8, audio: Audio, r
 
 fn status(comptime what: []const u8, args: anytype) void {
     std.debug.print("  " ++ what ++ "...\n", args);
-}
-
-const USAGE =
-    \\usage: mp3notes <input.mp3> [output.txt] [--wav decoded.wav] [--bpm-hint BPM]
-    \\  output defaults to <input>.txt
-    \\  --wav       also write the decoded PCM as a 16-bit WAV file
-    \\  --bpm-hint  approximate tempo; fixes half/double-tempo mistakes
-    \\
-;
-
-pub fn main(init: std.process.Init) !void {
-    const io = init.io;
-    const a = init.arena.allocator();
-
-    var input: ?[]const u8 = null;
-    var output: ?[]const u8 = null;
-    var wav: ?[]const u8 = null;
-    var bpm_hint: ?f32 = null;
-    var args = init.minimal.args.iterate();
-    _ = args.skip();
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--wav")) {
-            wav = args.next() orelse {
-                std.debug.print(USAGE, .{});
-                return error.MissingArgument;
-            };
-        } else if (std.mem.eql(u8, arg, "--bpm-hint")) {
-            const v = args.next() orelse {
-                std.debug.print(USAGE, .{});
-                return error.MissingArgument;
-            };
-            bpm_hint = std.fmt.parseFloat(f32, v) catch {
-                std.debug.print("invalid --bpm-hint value: {s}\n", .{v});
-                return error.InvalidArgument;
-            };
-            if (bpm_hint.? < TEMPO_MIN or bpm_hint.? > TEMPO_MAX) {
-                std.debug.print("--bpm-hint must be between {d} and {d}\n", .{ TEMPO_MIN, TEMPO_MAX });
-                return error.InvalidArgument;
-            }
-        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(USAGE, .{});
-            return;
-        } else if (input == null) {
-            input = arg;
-        } else if (output == null) {
-            output = arg;
-        } else {
-            std.debug.print(USAGE, .{});
-            return error.TooManyArguments;
-        }
-    }
-    const in_path = input orelse {
-        std.debug.print(USAGE, .{});
-        return error.MissingArgument;
-    };
-    const out_path = output orelse blk: {
-        const ext = std.fs.path.extension(in_path);
-        break :blk try std.fmt.allocPrint(a, "{s}.txt", .{in_path[0 .. in_path.len - ext.len]});
-    };
-
-    std.debug.print("decoding {s}\n", .{in_path});
-    const data = try std.Io.Dir.cwd().readFileAlloc(io, in_path, a, .limited(1 << 30));
-    const audio = try decodeMp3(a, data);
-    std.debug.print("  {d} Hz, {d} ch, {d} kbps, {d:.1}s\n", .{
-        audio.rate,                                                                                    audio.channels, audio.bitrate_kbps,
-        @as(f32, @floatFromInt(audio.pcm.len / audio.channels)) / @as(f32, @floatFromInt(audio.rate)),
-    });
-    if (wav) |p| {
-        try writeWav(io, p, audio);
-        std.debug.print("  wrote {s}\n", .{p});
-    }
-
-    std.debug.print("analyzing\n", .{});
-    const prior: TempoPrior = if (bpm_hint) |h|
-        .{ .center = h, .octaves = TEMPO_HINT_OCTAVES }
-    else
-        .{ .center = TEMPO_PRIOR_BPM, .octaves = TEMPO_PRIOR_OCTAVES };
-    const result = try analyze(a, audio, prior);
-    try writeReport(io, out_path, in_path, audio, result);
-
-    std.debug.print("bpm {d:.2}  key {s} {s}  beats {d}  chords {d}\n", .{
-        result.bpm, NOTE_NAMES[result.key_root], if (result.key_minor) "minor" else "major", result.beats.len, result.chords.len,
-    });
-    for (DRUM_BANDS, result.drums) |band, hits| std.debug.print("  {s:<8} hits  {d}\n", .{ band.name, hits.len });
-    std.debug.print("  {s:<8} notes {d}\n  {s:<8} notes {d}\n  {s:<8} notes {d}\n", .{
-        "bass", result.bass.len, "melody", result.melody.len, "harmony", result.harmony.len,
-    });
-    std.debug.print("wrote {s}\n", .{out_path});
 }
 
 // ============================================================================
