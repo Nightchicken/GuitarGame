@@ -184,9 +184,12 @@ pub fn drawSongSelect(ui: *widgets.WidgetStream, io: std.Io, state: *data.GameSt
         state.prevSong = null;
         for (data.discovered[0..data.discovered_count]) |*d| {
             if (d.selected) {
+                if (state.songs.poolLen >= data.MAX_SONGS) break;
                 state.songs.append(d.title[0..], d.folder[0..], d.bps);
                 if (state.songs.tail) |tail| {
                     tail.notes = d.notes;
+                    tail.audio_path = d.audio_path;
+                    tail.offset = d.offset;
                 }
             }
         }
@@ -319,13 +322,9 @@ pub fn drawNotes(state: *const data.GameState, settings: *const data.Settings, s
         const t1 = (fl + 1.0) / 5.0;
         const lane_col = if (state.starPowerActive) settings.colors[6] else settings.colors[l];
 
-        // Extend range to include holds that started before the current beat
-        // Maximum hold length is SLOTS, so we need to look back that far
-        const s_min: usize = if (state.beat > @as(f32, @floatFromInt(systems.SLOTS)))
-            @intFromFloat(state.beat - @as(f32, @floatFromInt(systems.SLOTS)))
-        else
-            0;
-        const s_max: usize = @min(systems.SLOTS - 1, @as(usize, @intFromFloat(state.beat + systems.SCROLL_BEATS)) + 1);
+        // Look back far enough to include the longest hold that started before the current beat
+        const s_min = systems.slot_at(state.beat - @as(f32, @floatFromInt(state.longest_hold + 1)));
+        const s_max = @min(systems.SLOTS - 1, systems.slot_at(state.beat + systems.SCROLL_BEATS) + 1);
 
         var s = s_min;
         while (s <= s_max) : (s += 1) {
@@ -636,7 +635,9 @@ pub fn drawSettings(ui: *widgets.WidgetStream, io: std.Io, settings: *data.Setti
 
     // ── Delay ──
     const delaySectionY = contentY + 6.0 * keyRowH + 18;
-    rl.drawText("Delay", @intFromFloat(leftX + 6), @intFromFloat(delaySectionY), 18, sectionColor);
+    var delay_buf: [48]u8 = undefined;
+    const delay_label = std.fmt.bufPrintZ(&delay_buf, "Note delay: {d:.2} s", .{settings.delay}) catch "Note delay";
+    rl.drawText(delay_label, @intFromFloat(leftX + 6), @intFromFloat(delaySectionY), 18, sectionColor);
     ui.slider(
         .{ .x = leftX + 6, .y = delaySectionY + 22, .width = leftW - 12, .height = 30 },
         "",
@@ -902,7 +903,9 @@ pub fn drawSettingsOverlay(ui: *widgets.WidgetStream, io: std.Io, state: *data.G
 
     // ── Delay ──
     const delaySectionY = contentY + 6.0 * keyRowH + 18;
-    rl.drawText("Delay", @intFromFloat(leftX + 6), @intFromFloat(delaySectionY), 18, sectionColor);
+    var delay_buf: [48]u8 = undefined;
+    const delay_label = std.fmt.bufPrintZ(&delay_buf, "Note delay: {d:.2} s", .{settings.delay}) catch "Note delay";
+    rl.drawText(delay_label, @intFromFloat(leftX + 6), @intFromFloat(delaySectionY), 18, sectionColor);
     ui.slider(
         .{ .x = leftX + 6, .y = delaySectionY + 22, .width = leftW - 12, .height = 30 },
         "",

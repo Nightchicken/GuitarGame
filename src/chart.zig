@@ -76,7 +76,8 @@ const Grid = struct {
 
 /// Fits a fixed-tempo grid to the tracked beats, with slot 0 within one beat of the song start.
 fn fit_grid(r: mp3notes.Analysis, subdivision: usize) Grid {
-    const beat = 60.0 / r.bpm;
+    const bpm = if (std.math.isFinite(r.bpm) and r.bpm > 0) r.bpm else 120;
+    const beat = 60.0 / bpm;
     const period = beat / @as(f32, @floatFromInt(subdivision));
     if (r.beats.len == 0) return .{ .period = period, .offset = 0 };
     var sum: f32 = 0;
@@ -190,7 +191,7 @@ pub fn build(r: mp3notes.Analysis, opts: BuildOptions) Chart {
     }
 
     var chart = Chart{
-        .bps = r.bpm / 60.0 * @as(f32, @floatFromInt(p.subdivision)),
+        .bps = 1.0 / g.period,
         .offset = g.offset,
         .role = role,
         .difficulty = opts.difficulty,

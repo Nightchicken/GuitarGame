@@ -14,6 +14,8 @@ pub const SongNode = struct {
     file_path: [:0]const u8,
     bps: f32,
     notes: [5]LaneNotes = NO_NOTES,
+    audio_path: [256:0]u8 = .{0} ** 256,
+    offset: f32 = 0,
     prev: ?*SongNode,
     next: ?*SongNode,
 };
@@ -138,6 +140,12 @@ pub const GameState = struct {
     maxCombo: u32 = 0,
     endBeat: f32 = 0,
     resultsCountdown: f32 = -1.0,
+    // Seconds into the song audio; negative during the lead-in.
+    song_time: f32 = 0,
+    music: ?rl.Music = null,
+    music_started: bool = false,
+    music_paused: bool = false,
+    longest_hold: usize = 0,
 };
 pub const NoteStats = struct {
     total: u32,
@@ -167,6 +175,8 @@ pub const DiscoveredSong = struct {
     texture: rl.Texture2D = undefined,
     has_texture: bool = false,
     notes: [5]LaneNotes = NO_NOTES,
+    audio_path: [256:0]u8 = .{0} ** 256,
+    offset: f32 = 0,
 };
 pub var discovered: [MAX_DISCOVERED]DiscoveredSong = undefined;
 pub var discovered_count: usize = 0;

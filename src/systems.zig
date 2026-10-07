@@ -6,6 +6,11 @@ const chart = @import("chart.zig");
 pub const SLOTS: usize = chart.SLOTS;
 pub const SCROLL_BEATS: f32 = 8.0;
 pub const HIT_WINDOW: f32 = 0.35;
+/// Slot index at a (possibly negative) beat position, clamped to the chart.
+pub fn slot_at(beat: f32) usize {
+    if (beat <= 0) return 0;
+    return @min(SLOTS - 1, @as(usize, @intFromFloat(beat)));
+}
 pub fn getNoteU128(laneNotes: data.LaneNotes, slot: usize) u128 {
     return laneNotes[slot / chart.SLOTS_PER_CHUNK];
 }
@@ -55,7 +60,7 @@ pub fn updateStars(state: *data.GameState) void {
         state.starCount = 0;
         state.starPowerComboComplete = false;
     } else {
-        state.starCount = @min(5, @as(u8, @intCast(1 + (state.comboCount - 1) / 10)));
+        state.starCount = @intCast(@min(5, 1 + (state.comboCount - 1) / 10));
     }
 
     state.starMultiplier = switch (state.starCount) {
@@ -75,10 +80,12 @@ pub fn getScoreMultiplier(state: *const data.GameState) u32 {
 }
 pub fn computeEndBeat(state: *data.GameState) void {
     var lastSlot: usize = 0;
+    state.longest_hold = 0;
     for (0..5) |l| {
         for (0..SLOTS) |s| {
             if (present(state.notes[l], s)) {
                 lastSlot = @max(lastSlot, s);
+                if (connected(state.notes[l], s)) state.longest_hold = @max(state.longest_hold, holdLen(state.notes[l], s));
             }
         }
     }
@@ -134,11 +141,15 @@ pub fn update(state: *data.GameState, settings: *const data.Settings) void {
         state.prevSong = state.songs.current;
         state.notes = if (state.songs.current) |song| song.notes else data.NO_NOTES;
         computeEndBeat(state);
+        start_song_audio(state);
     }
 
     const dt = rl.getFrameTime();
     const bps = if (state.songs.current) |c| c.bps else 2.0;
-    state.beat += bps * dt;
+    const offset = if (state.songs.current) |c| c.offset else 0;
+    state.song_time += dt;
+    sync_song_clock(state);
+    state.beat = (state.song_time - offset - settings.delay) * bps;
 
     // Handle star power activation with action button (settings.keys[5])
     if (rl.isKeyPressed(settings.keys[5]) and state.starPowerMeter >= 0.5 and !state.starPowerActive) {
@@ -178,7 +189,8 @@ pub fn update(state: *data.GameState, settings: *const data.Settings) void {
 
         if (state.holdActive[l]) {
             if (!rl.isKeyDown(settings.keys[l])) {
-                const beatsHeld = state.beat - state.holdStartBeat[l];
+                // The beat can step back (audio resync, delay changed while paused), so clamp at 0.
+                const beatsHeld = @max(0, state.beat - state.holdStartBeat[l]);
                 const multiplier = getScoreMultiplier(state);
                 const points = 25 * @as(u32, @intFromFloat(beatsHeld)) * multiplier;
                 if (points > 0) {
@@ -197,8 +209,8 @@ pub fn update(state: *data.GameState, settings: *const data.Settings) void {
         } else if (rl.isKeyPressed(settings.keys[l])) {
             var bestSlot: ?usize = null;
             var bestDist: f32 = HIT_WINDOW;
-            const sMin: usize = if (state.beat > HIT_WINDOW) @intFromFloat(state.beat - HIT_WINDOW) else 0;
-            const sMax: usize = @min(SLOTS - 1, @as(usize, @intFromFloat(state.beat + HIT_WINDOW)) + 1);
+            const sMin = slot_at(state.beat - HIT_WINDOW);
+            const sMax = @min(SLOTS - 1, slot_at(state.beat + HIT_WINDOW) + 1);
             var s = sMin;
             while (s <= sMax) : (s += 1) {
                 if (!present(laneBits, s)) continue;
@@ -372,6 +384,8 @@ pub fn scan_songs(io: std.Io) void {
     while (iter.next(io) catch null) |entry| {
         if (data.discovered_count >= data.MAX_DISCOVERED) break;
         if (entry.kind != .directory) continue;
+        // Folder names must fit DiscoveredSong.folder; longer ones can't be addressed later.
+        if (entry.name.len >= data.discovered[0].folder.len) continue;
 
         var songData = &data.discovered[data.discovered_count];
         songData.* = .{};
@@ -411,6 +425,8 @@ pub fn scan_songs(io: std.Io) void {
                     isTitleFound = true;
                 } else if (std.mem.eql(u8, key, "bps")) {
                     songData.bps = std.fmt.parseFloat(f32, val) catch 2.5;
+                } else if (std.mem.eql(u8, key, "offset")) {
+                    songData.offset = std.fmt.parseFloat(f32, val) catch 0;
                 } else {
                     // Parse notes_lane0 through notes_lane4
                     for (0..5) |lane| {
@@ -431,9 +447,11 @@ pub fn scan_songs(io: std.Io) void {
         }
 
         if (!isTitleFound) {
-            std.mem.copyForwards(u8, songData.title[0..], entry.name);
-            songData.title[entry.name.len] = 0;
+            const copyLen = @min(entry.name.len, songData.title.len - 1);
+            std.mem.copyForwards(u8, songData.title[0..], entry.name[0..copyLen]);
+            songData.title[copyLen] = 0;
         }
+        find_audio(io, songsDir, entry.name, &songData.audio_path);
 
         var imagePathBuf: [256]u8 = undefined;
         if (std.fmt.bufPrintZ(&imagePathBuf, "songs/{s}/image.png", .{entry.name}) catch null) |imagePath| {
@@ -567,4 +585,84 @@ fn reset_import() void {
     im.err = null;
     im.cancelled = false;
     im.folder_len = 0;
+}
+
+// ─ Song audio ──────────────────────────────────────────────────────────────
+const AUDIO_EXTENSIONS = [_][]const u8{ ".mp3", ".ogg", ".wav", ".flac", ".qoa" };
+/// Drift between the song clock and the audio position that is snapped instead of smoothed.
+const DRIFT_SNAP = 0.1;
+const DRIFT_SMOOTHING = 0.05;
+
+/// Finds the first playable audio file in songs/<name>/ and writes its path into `out`.
+fn find_audio(io: std.Io, songs_dir: std.Io.Dir, name: []const u8, out: *[256:0]u8) void {
+    out[0] = 0;
+    var dir = songs_dir.openDir(io, name, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        for (AUDIO_EXTENSIONS) |ext| if (std.ascii.endsWithIgnoreCase(entry.name, ext)) {
+            _ = std.fmt.bufPrintZ(out, "songs/{s}/{s}", .{ name, entry.name }) catch {
+                out[0] = 0;
+            };
+            return;
+        };
+    }
+}
+
+/// Loads the current song's audio and rewinds the clock to the start of the lead-in.
+fn start_song_audio(state: *data.GameState) void {
+    stop_song_audio(state);
+    const song = state.songs.current orelse return;
+    // Lead-in long enough for the first notes to scroll down from the horizon.
+    state.song_time = -SCROLL_BEATS / song.bps;
+    const path = std.mem.sliceTo(&song.audio_path, 0);
+    if (path.len == 0) return;
+    var music = rl.loadMusicStream(song.audio_path[0..path.len :0]) catch {
+        std.debug.print("could not load audio {s}\n", .{path});
+        return;
+    };
+    music.looping = false;
+    state.music = music;
+}
+
+pub fn stop_song_audio(state: *data.GameState) void {
+    if (state.music) |m| {
+        rl.stopMusicStream(m);
+        rl.unloadMusicStream(m);
+    }
+    state.music = null;
+    state.music_started = false;
+    state.music_paused = false;
+}
+
+/// Starts the music when the lead-in ends, then keeps the song clock locked to the audio position.
+fn sync_song_clock(state: *data.GameState) void {
+    const m = state.music orelse return;
+    if (!state.music_started) {
+        if (state.song_time < 0) return;
+        rl.playMusicStream(m);
+        state.music_started = true;
+        return;
+    }
+    if (state.music_paused or !rl.isMusicStreamPlaying(m)) return;
+    // getMusicTimePlayed advances in buffer-sized steps, so smooth small differences.
+    const drift = rl.getMusicTimePlayed(m) - state.song_time;
+    if (@abs(drift) > DRIFT_SNAP) state.song_time += drift else state.song_time += drift * DRIFT_SMOOTHING;
+}
+
+/// Call every frame: feeds the audio stream, mirrors the pause state, and stops audio off the game screen.
+pub fn update_audio(state: *data.GameState, screen: data.Screen) void {
+    const m = state.music orelse return;
+    if (screen != .game) return stop_song_audio(state);
+    if (state.music_started) {
+        if (state.paused and !state.music_paused) {
+            rl.pauseMusicStream(m);
+            state.music_paused = true;
+        } else if (!state.paused and state.music_paused) {
+            rl.resumeMusicStream(m);
+            state.music_paused = false;
+        }
+    }
+    rl.updateMusicStream(m);
 }

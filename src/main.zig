@@ -24,12 +24,15 @@ pub fn main(init: std.process.Init) !void {
     rl.setWindowMinSize(500, 400);
     defer rl.closeWindow();
     rl.setTargetFPS(60);
+    rl.initAudioDevice();
+    defer rl.closeAudioDevice();
     rl.setExitKey(.null);
 
     var ui = widgets.WidgetStream{};
     var screen: data.Screen = .main;
     var state = data.GameState{};
     var settings = data.Settings{};
+    defer systems.stop_song_audio(&state);
 
     systems.loadSettings(io, &settings);
     systems.loadUiTheme(io);
@@ -52,6 +55,7 @@ pub fn main(init: std.process.Init) !void {
             .import_song => render.draw_import(&ui, io),
             .exit => break :gameLoop,
         };
+        systems.update_audio(&state, screen);
     }
 }
 
@@ -111,7 +115,8 @@ fn run_chart(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     const dir = song_dir orelse try std.fmt.allocPrint(a, "songs/{s}", .{std.fs.path.stem(in_path)});
 
     const c = try chart.chart_song(a, init.io, in_path, dir, opts);
-    std.debug.print("bpm {d:.1}  offset {d:.3}s\n", .{ c.bps * 60, c.offset });
+    const beats_per_slot: f32 = @floatFromInt(c.difficulty.params().subdivision);
+    std.debug.print("bpm {d:.1}  offset {d:.3}s\n", .{ c.bps * 60 / beats_per_slot, c.offset });
     for (std.enums.values(chart.Role)) |role| {
         std.debug.print("  {s:<8} prevalence {d:.2}{s}\n", .{ @tagName(role), c.prevalence[@intFromEnum(role)], if (role == c.role) "  <- charted" else "" });
     }

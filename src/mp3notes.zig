@@ -1188,6 +1188,7 @@ const HOP = 512;
 const N_ONSET = 1024;
 const N_PITCH = 4096;
 const N_BASS = 8192;
+const MIN_WINDOWS = 4;
 const PITCH_MAX_HZ = 5000.0;
 const BASS_MAX_HZ = 800.0;
 const HPSS_HALF = 8;
@@ -2045,6 +2046,8 @@ pub fn analyze(a: Allocator, audio: Audio, prior: TempoPrior) !Analysis {
     const mono_full = try to_mono(a, audio);
     const factor: usize = @max(1, @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(audio.rate)) / TARGET_RATE))));
     const x = try downsample(a, mono_full, factor);
+    // The longest STFT needs several full windows; shorter clips have nothing to analyze.
+    if (x.len < N_BASS * MIN_WINDOWS) return error.AudioTooShort;
     const rate = @as(f32, @floatFromInt(audio.rate)) / @as(f32, @floatFromInt(factor));
     const fps = rate / HOP;
     const duration = @as(f32, @floatFromInt(mono_full.len)) / @as(f32, @floatFromInt(audio.rate));
